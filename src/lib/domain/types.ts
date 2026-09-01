@@ -1,6 +1,11 @@
-// Core domain types for the Alepes cash-flow-to-investment engine.
-// These are pure, provider-agnostic types — financial integrations stay
-// behind the provider interfaces in `providers/`, never coupled here.
+// LEGACY DISPLAY-ONLY TYPES (superseded by @alepes/domain + @alepes/money).
+//
+// This file remains ONLY so the existing frontend mock UI keeps rendering during
+// the migration. It makes NO financial decisions — those live in the pure
+// integer-cents packages under `packages/`. Do not add financial logic here.
+//
+//   types   → packages/domain/src/index.ts
+//   money   → packages/money/src/index.ts   (integer cents, not floats)
 
 /** A single holding in a portfolio, with target and current allocation. */
 export interface Holding {

@@ -1,0 +1,16 @@
+{
+  "name": "@alepes/integration-conformance",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@alepes/money": "*",
+    "@alepes/domain": "*",
+    "@alepes/rules-engine": "*",
+    "@alepes/allocation-engine": "*",
+    "@alepes/execution-policy": "*",
+    "@alepes/integration-runtime": "*",
+    "@alepes/mock-bank": "*",
+    "@alepes/mock-brokerage": "*"
+  }
+}

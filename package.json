@@ -1,7 +1,8 @@
 {
-  "name": "website",
-  "version": "0.1.0",
+  "name": "alepes",
+  "version": "0.2.0",
   "private": true,
+  "workspaces": ["packages/*"],
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -11,6 +12,14 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@alepes/domain": "*",
+    "@alepes/money": "*",
+    "@alepes/allocation-engine": "*",
+    "@alepes/rules-engine": "*",
+    "@alepes/execution-policy": "*",
+    "@alepes/integration-runtime": "*",
+    "@alepes/mock-bank": "*",
+    "@alepes/mock-brokerage": "*",
     "@base-ui/react": "^1.7.0",
     "@radix-ui/react-avatar": "^1.2.6",
     "@radix-ui/react-dialog": "^1.1.23",

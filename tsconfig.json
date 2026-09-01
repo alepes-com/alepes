@@ -19,7 +19,15 @@
       }
     ],
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@alepes/money": ["./packages/money/src/index.ts"],
+      "@alepes/domain": ["./packages/domain/src/index.ts"],
+      "@alepes/allocation-engine": ["./packages/allocation-engine/src/index.ts"],
+      "@alepes/rules-engine": ["./packages/rules-engine/src/index.ts"],
+      "@alepes/execution-policy": ["./packages/execution-policy/src/index.ts"],
+      "@alepes/integration-runtime": ["./packages/integration-runtime/src/index.ts"],
+      "@alepes/mock-bank": ["./packages/integrations/mock-bank/src/index.ts"],
+      "@alepes/mock-brokerage": ["./packages/integrations/mock-brokerage/src/index.ts"]
     }
   },
   "include": [
