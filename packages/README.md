@@ -57,8 +57,17 @@ construction (orders are always `buy`, never `sell`).
 npx vitest run
 ```
 
-The invariant suite covers: allocations never exceed deployable; exact
+The functional suite covers: allocations never exceed deployable; exact
 reconciliation after rounding; no negative allocation; overweight holdings
 starved until underweight alternatives are exhausted; band boundaries; $0 and
 degenerate inputs fail deterministically; byte-identical re-runs; a deposit can
 never be invested twice; and shadow-vs-live sharing one planning path.
+
+Additional suites:
+- `packages/allocation-engine/src/adversarial.test.ts` — missing/zero prices,
+  delisted symbols, unallocated-total targets, duplicate holdings, min-trade >
+  deployable, overflow/extremes, duplicate events, idempotency.
+- `packages/allocation-engine/src/property.test.ts` — fast-check properties:
+  every amount ≥ 0, sum ≤ deployable, sum === deployable when fully allocatable.
+- `packages/integration-conformance/src/conformance.ts` — reusable certification
+  harness; certify any bank/brokerage plugin against its capability contract.
