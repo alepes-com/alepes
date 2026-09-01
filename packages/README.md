@@ -43,9 +43,12 @@ construction (orders are always `buy`, never `sell`).
   decide anything.
 - **Money is integer cents** in the packages. Floats may enter only via
   `centsFromDollarsFloat` at a provider boundary, and are rounded once.
-- The legacy `src/lib/domain/` + `src/lib/providers/` remain **display-only** for
-  the existing mock UI during migration — they make no financial decisions and
-  will be retired once the UI is rewired to these packages.
+- **Exactly one decision engine.** The legacy UI modules under `src/lib/domain/`
+  (`allocation.ts`, `rules.ts`, `simulation.ts`) are now *compatibility facades*:
+  they marshal the React UI's dollar DTOs ↔ integer cents and delegate every
+  decision to `@alepes/*`. `marshal.ts` is pure data conversion. The UI types in
+  `types.ts` are display-only DTOs. This means Shadow Mode, simulations, UI
+  previews, tests, and eventual live execution all route through the same engine.
 
 ## Tests
 

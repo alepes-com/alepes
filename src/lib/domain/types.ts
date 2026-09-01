@@ -1,11 +1,12 @@
-// LEGACY DISPLAY-ONLY TYPES (superseded by @alepes/domain + @alepes/money).
+// UI-FACING TYPES (dollars, float) — the public contract the React UI reads.
 //
-// This file remains ONLY so the existing frontend mock UI keeps rendering during
-// the migration. It makes NO financial decisions — those live in the pure
-// integer-cents packages under `packages/`. Do not add financial logic here.
+// These types are DTOs for DISPLAY ONLY. The financial engine lives in the pure
+// integer-cents packages under `packages/` (see @alepes/money, @alepes/domain,
+// @alepes/allocation-engine, @alepes/rules-engine, @alepes/execution-policy).
 //
-//   types   → packages/domain/src/index.ts
-//   money   → packages/money/src/index.ts   (integer cents, not floats)
+// The facades in this directory (allocation.ts, rules.ts, simulation.ts) are the
+// ONLY bridge: they marshal these dollar DTOs ↔ integer cents and delegate ALL
+// financial decisions to @alepes/*. There is exactly one decision engine.
 
 /** A single holding in a portfolio, with target and current allocation. */
 export interface Holding {
