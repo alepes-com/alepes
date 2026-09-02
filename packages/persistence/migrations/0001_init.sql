@@ -1,16 +1,14 @@
 -- Alepes PostgreSQL schema for execution-plan persistence.
--- Everything in this migration is designed to enforce correctness at the
--- database level, not just in the domain layer.
+-- Correctness constraints are enforced at the database level, not just in the
+-- domain code.
 
--- Table: cash_events (observed cash movements)
--- Note: we use TEXT for ids today; a migration to ULID at the persistence
--- boundary adds the durable chain identity separately.
-
+-- Core plan row: one line per financial action, plus the provenance needed to
+-- reproduce it later.
 CREATE TABLE IF NOT EXISTS execution_plans (
   id TEXT PRIMARY KEY,
   user_id TEXT,
   portfolio_id TEXT NOT NULL,
-  cash_event_id TEXT NOT NULL,
+  cash_event_id TEXT NOT NULL UNIQUE,
   rule_version_id TEXT NOT NULL,
   portfolio_version_id TEXT NOT NULL,
   calculation_version TEXT NOT NULL,
@@ -19,9 +17,14 @@ CREATE TABLE IF NOT EXISTS execution_plans (
   disposition TEXT NOT NULL CHECK (disposition IN (
     'shadow', 'approval_required', 'approved', 'executing', 'executed', 'rejected', 'failed'
   )),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (cash_event_id, rule_version_id)
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- One CashEvent (an observed deposit) may never create more than one
+-- executable plan. A rule-version change may produce a new *draft* plan,
+-- but it must not silently create a second financial action. If multiple
+-- destinations are ever required explicitly, introduce a stable destination key
+-- ((cash_event_id, allocation_destination_id)) rather than loosening dedup.
 
 CREATE TABLE IF NOT EXISTS execution_plan_orders (
   id TEXT PRIMARY KEY,
@@ -35,7 +38,8 @@ CREATE TABLE IF NOT EXISTS execution_plan_orders (
 
 CREATE INDEX IF NOT EXISTS idx_execution_plan_orders__plan ON execution_plan_orders(execution_plan_id);
 
--- Append-only audit events. No UPDATE or DELETE is allowed.
+-- Append-only audit events. UPDATE and DELETE are errors; once written, an
+-- event cannot be altered or removed.
 CREATE TABLE IF NOT EXISTS execution_plan_events (
   id TEXT PRIMARY KEY,
   execution_plan_id TEXT NOT NULL REFERENCES execution_plans(id) ON DELETE CASCADE,
@@ -51,20 +55,46 @@ CREATE TABLE IF NOT EXISTS execution_plan_events (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Prevent updates or deletes on execution_plan_events (append-only).
-CREATE OR REPLACE FUNCTION noop_audit_guard() RETURNS TRIGGER AS $$
+-- Append-only: any UPDATE or DELETE of an audit event fails explicitly.
+CREATE OR REPLACE FUNCTION audit_immutable() RETURNS TRIGGER AS $$
 BEGIN
-  RETURN NEW;
+  RAISE EXCEPTION 'execution_plan_events are immutable';
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE RULE execution_plan_events_no_update AS
-  ON UPDATE TO execution_plan_events DO NOTHING;
+CREATE TRIGGER execution_plan_events_no_update BEFORE UPDATE ON execution_plan_events
+  FOR EACH ROW EXECUTE FUNCTION audit_immutable();
 
-CREATE OR REPLACE RULE execution_plan_events_no_delete AS
-  ON DELETE TO execution_plan_events DO NOTHING;
+CREATE TRIGGER execution_plan_events_no_delete BEFORE DELETE ON execution_plan_events
+  FOR EACH ROW EXECUTE FUNCTION audit_immutable();
 
--- Outbox: transactional events that a worker can safely pick up.
+-- Only `disposition` may change on execution_plans after creation. All other
+-- fields are immutable. This trigger enforces that.
+CREATE OR REPLACE FUNCTION execution_plans_lifecycle_guard() RETURNS TRIGGER AS $$
+BEGIN
+  IF OLD.disposition <> NEW.disposition THEN
+    IF OLD.id = NEW.id
+       AND OLD.cash_event_id = NEW.cash_event_id
+       AND OLD.rule_version_id = NEW.rule_version_id
+       AND OLD.portfolio_version_id = NEW.portfolio_version_id
+       AND OLD.calculation_version = NEW.calculation_version
+       AND OLD.input_snapshot_hash = NEW.input_snapshot_hash
+       AND OLD.deployable_cents = NEW.deployable_cents
+       AND OLD.created_at = NEW.created_at THEN
+      RETURN NEW;
+    END IF;
+  END IF;
+  RAISE EXCEPTION 'execution_plans are immutable after creation (only disposition may change)';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER execution_plans_disposition_guard BEFORE UPDATE ON execution_plans
+  FOR EACH ROW EXECUTE FUNCTION execution_plans_lifecycle_guard();
+
+CREATE OR REPLACE RULE execution_plans_no_delete AS
+  ON DELETE TO execution_plans DO INSTEAD NOTHING;
+
+-- Outbox: transactional events a worker can safely pick up.
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY,
   type TEXT NOT NULL,

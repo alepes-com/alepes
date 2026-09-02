@@ -26,16 +26,30 @@ function canonicalize(value: unknown): string {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalize(obj[k])}`).join(",")}}`;
 }
 
-/** A simple, deterministic, content-addressed FNV-1a 32-bit hash (hex). */
-export function hashCanonical(value: unknown): string {
+/** A deterministic, collision-resistant SHA-256 hash of canonical JSON.
+ *
+ * Why SHA-256: `inputSnapshotHash` is financial provenance. Six months from now,
+ * support may need to prove an old plan was generated from exactly the recorded
+ * inputs. FNV-1a is fine for hash tables; SHA-256 is the right choice there.
+ *
+ * Works in both Node (crypto.subtle or node:crypto) and browsers.
+ */
+export async function hashCanonical(value: unknown): Promise<string> {
   const s = canonicalize(value);
-  // FNV-1a 32-bit, hex-encoded. Deterministic and dependency-free.
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
+  const bytes = new TextEncoder().encode(s);
+
+  if (typeof globalThis.crypto?.subtle?.digest === "function") {
+    // WebCrypto (browser or Node 18+)
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
   }
-  return (h >>> 0).toString(16).padStart(8, "0");
+
+  // Node-only fallback: the module-level require for node:crypto is safe since this
+  // path is only reached off-browser.
+  const { createHash } = await import("crypto");
+  return createHash("sha256").update(new TextEncoder().encode(s)).digest("hex");
 }
 
 /** Version that identifies the engine set that produced a plan. */
@@ -48,12 +62,12 @@ export function calculationVersion(): string {
  * Includes the cash event, the rules (as they were at evaluation), and the
  * portfolio state — everything that can affect the resulting plan.
  */
-export function inputSnapshotHash(
+export async function inputSnapshotHash(
   cashEvent: CashEvent,
   cashEventRules: readonly { id: string; order: number; trigger: string; reserveBalance: unknown; action: string; amount: unknown; maxPerDeposit?: unknown; maxPerMonth?: unknown }[],
   portfolioSnapshot: { portfolio: { holdings: { symbol: string; targetPct: number }[] }; positions: { symbol: string; value: unknown }[] }
-): string {
-  return `${HASH_SEED}:${hashCanonical({
+): Promise<string> {
+  return `${HASH_SEED}:${await hashCanonical({
     cashEvent,
     rules: cashEventRules,
     portfolio: portfolioSnapshot,

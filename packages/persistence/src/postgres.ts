@@ -16,6 +16,21 @@ const TABLE_ORDERS = "execution_plan_orders";
 const TABLE_EVENTS = "execution_plan_events";
 const TABLE_OUTBOX = "outbox";
 
+function mapAuditStageToKind(stage: string): string {
+  switch (stage) {
+    case "plan_created": case "created": return "plan.created";
+    case "policy_evaluated": return "policy.evaluated";
+    case "approval_requested": return "approval.requested";
+    case "approval_granted": return "approval.granted";
+    case "execution_started": return "execution.started";
+    case "order_submitted": return "order.submitted";
+    case "order_filled": return "order.filled";
+    case "execution_completed": return "execution.completed";
+    case "execution_failed": return "execution.failed";
+    default: return stage;
+  }
+}
+
 export interface PostgresConfig {
   connectionString: string;
 }
@@ -39,12 +54,10 @@ class PostgresExecutionRepository {
     try {
       await client.query("BEGIN");
 
-      // Idempotent insert: replaying the same (cash_event_id, rule_version_id)
-      // returns the existing row instead of creating a duplicate.
       const insert = await client.query<{ id: string }>(
         `INSERT INTO ${TABLE_PLANS} (id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (cash_event_id, rule_version_id) DO NOTHING
+         ON CONFLICT (cash_event_id) DO NOTHING
          RETURNING id`,
         [
           input.id,
@@ -63,10 +76,9 @@ class PostgresExecutionRepository {
       const replayed = insert.rowCount === 0;
 
       if (replayed) {
-        // Replay: look up the pre-existing plan id so callers get the original.
         const existing = await client.query<{ id: string }>(
-          `SELECT id FROM ${TABLE_PLANS} WHERE cash_event_id = $1 AND rule_version_id = $2`,
-          [input.cashEventId, input.ruleVersionId]
+          `SELECT id FROM ${TABLE_PLANS} WHERE cash_event_id = $1`,
+          [input.cashEventId]
         );
         const existingId = existing.rows[0]?.id;
         if (!existingId) {
@@ -78,7 +90,6 @@ class PostgresExecutionRepository {
 
       const persistedPlanId = insert.rows[0].id as PersistenceId;
 
-      // Orders
       for (const order of input.plan.orders ?? []) {
         await client.query(
           `INSERT INTO ${TABLE_ORDERS} (id, execution_plan_id, symbol, amount_cents, side, shares)
@@ -94,7 +105,6 @@ class PostgresExecutionRepository {
         );
       }
 
-      // Initial audit event
       await client.query(
         `INSERT INTO ${TABLE_EVENTS} (id, execution_plan_id, at, kind, summary, detail, amount_cents)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -109,10 +119,9 @@ class PostgresExecutionRepository {
         ]
       );
 
-      // Outbox event (same transaction)
       await client.query(
         `INSERT INTO ${TABLE_OUTBOX} (id, type, payload) VALUES ($1, $2, $3)`,
-        [ulid(), "ExecutionPlanCreated", JSON.stringify({ planId: persistedPlanId })]
+        [ulidOf(), "ExecutionPlanCreated", JSON.stringify({ planId: persistedPlanId })]
       );
 
       await client.query("COMMIT");
@@ -142,7 +151,11 @@ class PostgresExecutionRepository {
       portfolioVersionId: row.portfolio_version_id,
       calculationVersion: row.calculation_version,
       inputSnapshotHash: row.input_snapshot_hash,
-      deployableCents: nonNegativeCents(typeof row.deployable_cents === "string" ? parseInt(row.deployable_cents, 10) : row.deployable_cents),
+      deployableCents: nonNegativeCents(
+        typeof row.deployable_cents === "string"
+          ? parseInt(row.deployable_cents, 10)
+          : row.deployable_cents
+      ),
       disposition: row.disposition as PersistableDisposition,
       plan: undefined as unknown as PersistableExecutionPlan["plan"],
     };
@@ -164,6 +177,7 @@ class PostgresExecutionRepository {
     planId: PersistenceId,
     record: import("@alepes/domain").AuditRecord
   ): Promise<void> {
+    const kind = mapAuditStageToKind(record.stage);
     await this.pool.query(
       `INSERT INTO ${TABLE_EVENTS} (id, execution_plan_id, at, kind, summary, detail, amount_cents)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -171,7 +185,7 @@ class PostgresExecutionRepository {
         record.id,
         planId,
         record.at,
-        record.stage,
+        kind,
         record.summary,
         record.detail,
         record.amountCents ?? 0,
@@ -193,11 +207,13 @@ class PostgresOutboxRepository {
   async append(payload: { type: string; payload: Record<string, unknown> }): Promise<void> {
     await this.pool.query(
       `INSERT INTO ${TABLE_OUTBOX} (id, type, payload) VALUES ($1, $2, $3)`,
-      [ulid(), payload.type, payload.payload]
+      [ulidOf(), payload.type, payload.payload]
     );
   }
 
-  async claimPending(limit: number): Promise<Array<{ id: PersistenceId; type: string; payload: Record<string, unknown> }>> {
+  async claimPending(
+    limit: number
+  ): Promise<Array<{ id: PersistenceId; type: string; payload: Record<string, unknown> }>> {
     const res = await this.pool.query(
       `SELECT id, type, payload FROM ${TABLE_OUTBOX} WHERE claimed_at IS NULL ORDER BY created_at ASC LIMIT $1`,
       [limit]
@@ -210,6 +226,6 @@ class PostgresOutboxRepository {
   }
 }
 
-function ulid(): string {
+function ulidOf(): string {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
 }
