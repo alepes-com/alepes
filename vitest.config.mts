@@ -14,6 +14,7 @@ const packages = [
   "rules-engine",
   "execution-policy",
   "integration-runtime",
+  "persistence",
 ];
 const alias: Record<string, string> = {
   "@": path.resolve(dirname, "./src"),

@@ -26,6 +26,7 @@
       "@alepes/rules-engine": ["./packages/rules-engine/src/index.ts"],
       "@alepes/execution-policy": ["./packages/execution-policy/src/index.ts"],
       "@alepes/integration-runtime": ["./packages/integration-runtime/src/index.ts"],
+      "@alepes/persistence": ["./packages/persistence/src/index.ts"],
       "@alepes/mock-bank": ["./packages/integrations/mock-bank/src/index.ts"],
       "@alepes/mock-brokerage": ["./packages/integrations/mock-brokerage/src/index.ts"]
     }
