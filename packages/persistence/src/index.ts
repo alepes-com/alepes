@@ -6,3 +6,4 @@ export {
   ulid,
   calculationVersion,
 } from "./identity";
+export { runMigrations } from "./migrations";

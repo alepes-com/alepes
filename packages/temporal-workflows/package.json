@@ -1,0 +1,24 @@
+{
+  "name": "@alepes/temporal-workflows",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@alepes/domain": "workspace:*",
+    "@alepes/money": "workspace:*",
+    "@alepes/integration-runtime": "workspace:*",
+    "@alepes/mock-brokerage": "workspace:*",
+    "@alepes/persistence": "workspace:*",
+    "temporalio": "^1.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "vitest": "^4.1.11",
+    "typescript": "^5"
+  }
+}

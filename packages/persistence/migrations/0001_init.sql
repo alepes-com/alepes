@@ -62,6 +62,9 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS execution_plan_events_no_update ON execution_plan_events;
+DROP TRIGGER IF EXISTS execution_plan_events_no_delete ON execution_plan_events;
+
 CREATE TRIGGER execution_plan_events_no_update BEFORE UPDATE ON execution_plan_events
   FOR EACH ROW EXECUTE FUNCTION audit_immutable();
 
@@ -88,6 +91,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS execution_plans_disposition_guard ON execution_plans;
+
 CREATE TRIGGER execution_plans_disposition_guard BEFORE UPDATE ON execution_plans
   FOR EACH ROW EXECUTE FUNCTION execution_plans_lifecycle_guard();
 
@@ -100,7 +105,12 @@ CREATE TABLE IF NOT EXISTS outbox (
   type TEXT NOT NULL,
   payload JSONB NOT NULL,
   claimed_at TIMESTAMPTZ,
+  claim_expires_at TIMESTAMPTZ,
+  attempts INT NOT NULL DEFAULT 0,
+  delivered_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox (claimed_at) WHERE claimed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_outbox_pending
+  ON outbox(created_at)
+  WHERE delivered_at IS NULL;

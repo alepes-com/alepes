@@ -8,6 +8,7 @@ import {
   PersistableExecutionPlan,
   PersistenceId,
   PersistableDisposition,
+  OutboxClaim,
 } from "./ports";
 import { nonNegativeCents } from "@alepes/money";
 
@@ -55,8 +56,8 @@ class PostgresExecutionRepository {
       await client.query("BEGIN");
 
       const insert = await client.query<{ id: string }>(
-        `INSERT INTO ${TABLE_PLANS} (id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        `INSERT INTO ${TABLE_PLANS} (id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition, plan_data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (cash_event_id) DO NOTHING
          RETURNING id`,
         [
@@ -70,6 +71,7 @@ class PostgresExecutionRepository {
           input.inputSnapshotHash,
           input.deployableCents as number,
           input.disposition,
+          JSON.stringify(input.plan ?? null),
         ]
       );
 
@@ -92,8 +94,9 @@ class PostgresExecutionRepository {
 
       for (const order of input.plan.orders ?? []) {
         await client.query(
-          `INSERT INTO ${TABLE_ORDERS} (id, execution_plan_id, symbol, amount_cents, side, shares)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
+          `INSERT INTO ${TABLE_ORDERS} (id, execution_plan_id, symbol, amount_cents, side, shares, idempotency_key)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (idempotency_key) DO NOTHING`,
           [
             order.id,
             persistedPlanId,
@@ -101,6 +104,7 @@ class PostgresExecutionRepository {
             order.amount as number,
             order.side,
             order.shares,
+            `${persistedPlanId}::${order.id}`,
           ]
         );
       }
@@ -136,7 +140,7 @@ class PostgresExecutionRepository {
 
   async loadPlan(id: PersistenceId): Promise<PersistableExecutionPlan | null> {
     const res = await this.pool.query(
-      `SELECT id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition
+      `SELECT id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition, plan_data
        FROM ${TABLE_PLANS} WHERE id = $1`,
       [id]
     );
@@ -157,7 +161,7 @@ class PostgresExecutionRepository {
           : row.deployable_cents
       ),
       disposition: row.disposition as PersistableDisposition,
-      plan: undefined as unknown as PersistableExecutionPlan["plan"],
+      plan: (row.plan_data ?? undefined) as PersistableExecutionPlan["plan"],
     };
   }
 
@@ -199,6 +203,21 @@ class PostgresExecutionRepository {
       [disposition, planId]
     );
   }
+
+  async loadOrders(planId: PersistenceId): Promise<Array<{ id: string; symbol: string; amountCents: number; side: string; shares: number; idempotencyKey: string }>> {
+    const res = await this.pool.query(
+      `SELECT id, symbol, amount_cents, side, shares, idempotency_key FROM ${TABLE_ORDERS} WHERE execution_plan_id = $1 ORDER BY created_at`,
+      [planId]
+    );
+    return res.rows.map((r) => ({
+      id: r.id,
+      symbol: r.symbol,
+      amountCents: typeof r.amount_cents === "string" ? parseInt(r.amount_cents, 10) : r.amount_cents,
+      side: r.side,
+      shares: r.shares,
+      idempotencyKey: r.idempotency_key,
+    }));
+  }
 }
 
 class PostgresOutboxRepository {
@@ -211,18 +230,64 @@ class PostgresOutboxRepository {
     );
   }
 
-  async claimPending(
-    limit: number
-  ): Promise<Array<{ id: PersistenceId; type: string; payload: Record<string, unknown> }>> {
-    const res = await this.pool.query(
-      `SELECT id, type, payload FROM ${TABLE_OUTBOX} WHERE claimed_at IS NULL ORDER BY created_at ASC LIMIT $1`,
-      [limit]
+  async claimPending(limit: number, leaseMs: number): Promise<OutboxClaim[]> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const res = await client.query(
+        `SELECT id, type, payload
+           FROM ${TABLE_OUTBOX}
+          WHERE delivered_at IS NULL
+            AND (claimed_at IS NULL OR claim_expires_at < now())
+          ORDER BY created_at ASC
+          FOR UPDATE SKIP LOCKED
+          LIMIT $1`,
+        [limit]
+      );
+      const ids = res.rows.map((r) => r.id);
+      if (ids.length === 0) {
+        await client.query("COMMIT");
+        return [];
+      }
+      const upd = await client.query(
+        `UPDATE ${TABLE_OUTBOX}
+            SET claimed_at = now(),
+                claim_expires_at = now() + ($1 || ' milliseconds')::interval,
+                attempts = attempts + 1
+          WHERE id = ANY($2)
+          RETURNING id, type, payload, claim_expires_at, attempts`,
+        [String(leaseMs), ids]
+      );
+      await client.query("COMMIT");
+      return upd.rows.map((r) => ({
+        id: r.id as PersistenceId,
+        type: r.type,
+        payload: r.payload,
+        claimExpiresAt: r.claim_expires_at,
+        attempts: r.attempts,
+      }));
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async markPublished(id: PersistenceId): Promise<void> {
+    await this.pool.query(
+      `UPDATE ${TABLE_OUTBOX} SET delivered_at = now() WHERE id = $1`,
+      [id]
     );
-    return res.rows.map((r) => ({
-      id: r.id as PersistenceId,
-      type: r.type,
-      payload: r.payload,
-    }));
+  }
+
+  async releaseClaim(id: PersistenceId): Promise<void> {
+    await this.pool.query(
+      `UPDATE ${TABLE_OUTBOX}
+          SET claimed_at = NULL, claim_expires_at = NULL
+        WHERE id = $1 AND delivered_at IS NULL`,
+      [id]
+    );
   }
 }
 

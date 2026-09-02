@@ -15,6 +15,7 @@ const packages = [
   "execution-policy",
   "integration-runtime",
   "persistence",
+  "temporal-workflows",
 ];
 const alias: Record<string, string> = {
   "@": path.resolve(dirname, "./src"),

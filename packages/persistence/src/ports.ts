@@ -87,6 +87,9 @@ export interface ExecutionRepository {
    * persisted plan — no financial amount, order, or order list may change.
    */
   updateDisposition(planId: PersistenceId, disposition: PersistableExecutionPlan["disposition"]): Promise<void>;
+
+  /** Load the orders belonging to a plan. */
+  loadOrders(planId: PersistenceId): Promise<Array<{ id: string; symbol: string; amountCents: number; side: string; shares: number; idempotencyKey: string }>>;
 }
 
 export interface OutboxEventInput {
@@ -96,10 +99,37 @@ export interface OutboxEventInput {
   payload: Record<string, unknown>;
 }
 
+export interface OutboxClaim {
+  id: PersistenceId;
+  type: string;
+  payload: Record<string, unknown>;
+  /** When the current lease expires; null if unclaimed. */
+  claimExpiresAt: string | null;
+  attempts: number;
+}
+
 export interface OutboxRepository {
   /** Add an outbox event inside the SAME transaction as its producing change. */
   append(payload: OutboxEventInput): Promise<void>;
 
-  /** Claim the next undelivered outbox events (for the eventual worker). */
-  claimPending(limit: number): Promise<Array<{ id: PersistenceId; type: string; payload: Record<string, unknown> }>>;
+  /**
+   * Atomically claim up to `limit` pending events with a lease.
+   * A pending event is: delivered_at IS NULL AND (claimed_at IS NULL OR
+   * claim_expires_at < now()). Claiming sets claimed_at, claim_expires_at
+   * (now() + lease), and increments attempts — inside one transaction using
+   * FOR UPDATE SKIP LOCKED, so concurrent publishers never double-claim.
+   * Abandoned claims become claimable again after the lease expires.
+   *
+   * Returns the claimed rows including the lease expiry.
+   */
+  claimPending(limit: number, leaseMs: number): Promise<OutboxClaim[]>;
+
+  /**
+   * Mark a claimed event as delivered (terminal state). After this, the event
+   * can never be claimed again.
+   */
+  markPublished(id: PersistenceId): Promise<void>;
+
+  /** Release a claim without delivering (e.g. handler failed and wants retry). */
+  releaseClaim(id: PersistenceId): Promise<void>;
 }
