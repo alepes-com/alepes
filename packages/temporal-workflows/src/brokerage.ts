@@ -4,6 +4,10 @@ import type { FilledOrder, OrderLine } from "./types";
  * Brokerage executor: the port through which the worker invokes the brokerage
  * capability. Implementations MUST be idempotent with respect to
  * `order.idempotencyKey`.
+ *
+ * This is an infrastructure adapter — it is INVOKED by the Temporal workflow
+ * with ExecutionDisposition already applied. See `BrokerageExecutor.executeOrders`
+ * where `orders` are the output of the execution policy gate.
  */
 export interface BrokerageExecutor {
   executeOrders(orders: OrderLine[]): Promise<BrokerageResult>;
@@ -20,6 +24,7 @@ export interface BrokerageResult {
 /**
  * Mock brokerage executor backed by @alepes/mock-brokerage in-memory plugin.
  * For Temporal tests we usually swap in a spy implementing the same interface.
+ * NOTE: this is invoked by the Temporal activity layer with policy-gated orders.
  */
 export function createMockBrokerageExecutor(): BrokerageExecutor & { calls: number } {
   let calls = 0;

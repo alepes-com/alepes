@@ -30,10 +30,30 @@ export interface MockBrokerage {
   submit(orders: ExecutionOrder[]): AuditRecord[];
 }
 
+function makeSubmitOrdersFn(executed: AuditRecord[]): (orders: ExecutionOrder[]) => AuditRecord[] {
+      return (orders) => {
+        const records: AuditRecord[] = [];
+        for (const o of orders) {
+          const at = new Date().toISOString();
+          records.push({
+            id: `${o.id}-exec`,
+            at,
+            eventId: o.id,
+            stage: "executed",
+            summary: `Executed ${o.side} ${o.symbol}`,
+            detail: `${o.side.toUpperCase()} ${o.symbol} for ${o.shares.toFixed(6)} shares (${o.amount}¢).`,
+            amountCents: o.amount,
+          });
+        }
+        return records;
+      };
+}
+
 export function createMockBrokerage(initial: MockBrokerageState): MockBrokerage {
   const portfolio = initial.portfolio;
   const prices = { ...initial.prices };
   const executed: AuditRecord[] = [];
+  const submitOrdersFn = makeSubmitOrdersFn(executed);
 
   const readPortfolio: ReadPortfolio = {
     id: CAPABILITIES.readPortfolio,
@@ -51,23 +71,6 @@ export function createMockBrokerage(initial: MockBrokerageState): MockBrokerage 
     invoke: async (symbols: string[]) =>
       Object.fromEntries(symbols.map((s) => [s, prices[s] ?? cents(0)])),
   };
-
-  function submitOrdersFn(orders: ExecutionOrder[]): AuditRecord[] {
-    const records: AuditRecord[] = [];
-    for (const o of orders) {
-      const at = new Date().toISOString();
-      records.push({
-        id: `${o.id}-exec`,
-        at,
-        eventId: o.id,
-        stage: "executed",
-        summary: `Executed ${o.side} ${o.symbol}`,
-        detail: `${o.side.toUpperCase()} ${o.symbol} for ${o.shares.toFixed(6)} shares (${o.amount}¢).`,
-        amountCents: o.amount,
-      });
-    }
-    return records;
-  }
 
   const submitOrders: SubmitOrders = {
     id: CAPABILITIES.submitOrders,
