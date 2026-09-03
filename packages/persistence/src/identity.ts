@@ -13,17 +13,30 @@ import type { CashEvent } from "@alepes/domain";
 
 const HASH_SEED = "alepes-input-v1";
 
-/** A canonical, deterministic string form of any JSON-serializable value. */
+/**
+ * A deterministic canonical JSON string for any JSON-serializable value.
+ * Objects get sorted keys for reproducibility, arrays are preserved in order.
+ */
 function canonicalize(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
+  if (value === null || value === undefined) {
+    return "null";
   }
   if (Array.isArray(value)) {
-    return `[${value.map(canonicalize).join(",")}]`;
+    const mapped: string[] = [];
+    for (const item of value) {
+      mapped.push(canonicalize(item));
+    }
+    return "[" + mapped.join(",") + "]";
   }
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalize(obj[k])}`).join(",")}}`;
+  if (typeof value === "object" && value !== null) {
+    const keys = Object.keys(value as Record<string, unknown>).sort();
+    const parts: string[] = [];
+    for (const k of keys) {
+      parts.push(JSON.stringify(k) + ":" + canonicalize((value as Record<string, unknown>)[k]));
+    }
+    return "{" + parts.join(",") + "}";
+  }
+  return JSON.stringify(value);
 }
 
 /** A deterministic, collision-resistant SHA-256 hash of canonical JSON.
@@ -99,9 +112,7 @@ export function ulid(): string {
   // 16 base32 chars of randomness (80 bits).
   const iv: Uint8Array = globalThis.crypto?.getRandomValues
     ? globalThis.crypto.getRandomValues(new Uint8Array(10))
-    : // Fallback for environments without WebCrypto (shouldn't happen)
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      new Uint8Array(require("crypto").randomBytes(10));
+    : new Uint8Array(require("crypto").randomBytes(10));
   for (const b of iv) {
     rand += ALPHABET[b % 32];
   }

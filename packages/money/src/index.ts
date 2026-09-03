@@ -136,11 +136,14 @@ export function divideIntoParts(a: Cents, parts: number): Cents[] {
   const total = a as number;
   const base = Math.trunc(total / parts);
   const remainder = total - base * parts;
-  const out: Cents[] = new Array(parts);
+  const step = total >= 0 ? 1 : -1;
+  let rem = Math.abs(remainder);
+  const result: Cents[] = [];
   for (let i = 0; i < parts; i++) {
-    out[i] = cents(base + (i < remainder ? Math.sign(total) : 0));
+    const bump = rem-- > 0 ? step : 0;
+    result.push(cents(base + bump));
   }
-  return out;
+  return result;
 }
 
 export function min(a: Cents, b: Cents): Cents {

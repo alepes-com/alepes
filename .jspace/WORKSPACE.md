@@ -1,13 +1,14 @@
 # J-Space Workspace Ledger
 
 ## Goal
-Add production-grade Temporal execution layer with proven-safe Postgres outbox, plus prove atomicity/rollback from a partial transaction and true initial outbox
+Toolchain foundation: Bun 1.4 (pkg mgmt+tests+runtime), Oxlint primary linter w/ Alepes anti-slop plugin, DuckDB analytics package (read-only, beside Postgres)
 
 ## Core
 
 ## Verified
+- ✓01 step-5 complete: Temporal workflows + outbox lease + 9 activity tests + 109 total pass — verified by: full test suite, typecheck, lint, build all green
 
 ## Open
 
 ## Next
-Implement atomicity + Temporal workflow + 10 test cases
+Create bun branch, run bun install, verify bun test against vitest suite

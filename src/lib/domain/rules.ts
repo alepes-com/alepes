@@ -5,6 +5,7 @@
 // rules engine, and converts back. No financial logic lives here.
 
 import { evaluateRule as evaluateRuleCore, eventQualifies as eventQualifiesCore } from "@alepes/rules-engine";
+import { formatCurrency } from "../format";
 import type { CashFlowRule, DepositEvent, RuleEvaluation } from "./types";
 import { ruleToDomain, depositToDomain, evaluationToUi, toNonNegativeCents } from "./marshal";
 
@@ -31,30 +32,29 @@ export function evaluateRule(
 
 /** Human-readable summary of a rule, matching the rule-builder phrasing. */
 export function summarizeRule(rule: CashFlowRule): string {
-  const usd = (n: number) => `$${n.toLocaleString("en-US")}`;
   const triggerPhrase =
-    rule.trigger === "payroll"
-      ? "a payroll deposit arrives"
-      : rule.trigger === "bonus"
-        ? "a bonus deposit arrives"
-        : "any deposit arrives";
+  rule.trigger === "payroll"
+    ? "a payroll deposit arrives"
+    : rule.trigger === "bonus"
+      ? "a bonus deposit arrives"
+      : "any deposit arrives";
 
   const actionPhrase =
-    rule.action === "invest_percentage"
-      ? `invest ${rule.amount}%`
-      : `invest ${usd(rule.amount as number)}`;
+  rule.action === "invest_percentage"
+    ? `invest ${rule.amount}%`
+    : `invest ${formatCurrency(rule.amount)}`;
 
   const parts = [
-    `When ${triggerPhrase}`,
-    `, ${actionPhrase}`,
-    ` as long as checking remains above ${usd(rule.reserveBalance)}`,
+  `When ${triggerPhrase}`,
+  `, ${actionPhrase}`,
+  ` as long as checking remains above ${formatCurrency(rule.reserveBalance)}`,
   ];
   if (rule.maxPerDeposit != null) {
-    parts.push(`, never more than ${usd(rule.maxPerDeposit)} from one deposit`);
+  parts.push(`, never more than ${formatCurrency(rule.maxPerDeposit)} from one deposit`);
   }
   if (rule.maxPerMonth != null) {
-    parts.push(`, capped at ${usd(rule.maxPerMonth)} per month`);
+  parts.push(`, capped at ${formatCurrency(rule.maxPerMonth)} per month`);
   }
   parts.push(".");
   return parts.join("");
-}
+  }
