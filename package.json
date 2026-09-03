@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "certify:duckdb": "bun packages/analytics/test/certify-duckdb-bun.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
