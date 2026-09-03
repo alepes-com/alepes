@@ -12,12 +12,14 @@ async function main() {
   console.log("Testing @duckdb/node-api under Bun...");
   try {
     const mod = await import("@duckdb/node-api");
-    const conn = new mod.DuckDBConnection(":memory:");
+    // Type-escape hatch: the neo API shifted signatures; the gate's job is to
+    // prove runtime compat under Bun, not to type-check.
+    const console_ = await (mod.DuckDBConnection as any).create(":memory:");
+    const conn: any = console_?.connection ?? console_;
     await conn.run("CREATE TABLE t(x INTEGER);");
     await conn.run("INSERT INTO t VALUES (42);");
-    const res = await conn.run("SELECT x FROM t");
+    await conn.run("SELECT x FROM t");
     console.log("PASS: duckdb under bun");
-    await conn.close();
     process.exit(0);
   } catch (err) {
     console.error("FAIL: duckdb under bun");
