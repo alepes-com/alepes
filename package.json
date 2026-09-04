@@ -2,13 +2,16 @@
   "name": "alepes",
   "version": "0.2.0",
   "private": true,
+  "packageManager": "bun@1.4.0",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint",
+    "lint": "oxlint",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:temporal": "vitest run packages/temporal-workflows/src/workflows.test.ts",
     "certify:duckdb": "bun packages/analytics/test/certify-duckdb-bun.ts"
   },
   "dependencies": {
@@ -26,6 +29,9 @@
     "@radix-ui/react-switch": "^1.3.7",
     "@radix-ui/react-tabs": "^1.1.21",
     "@radix-ui/react-tooltip": "^1.2.16",
+    "@temporalio/testing": "1.20.1",
+    "@temporalio/worker": "1.20.1",
+    "@temporalio/workflow": "1.20.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "framer-motion": "^13.1.1",
@@ -39,7 +45,6 @@
     "shadcn": "^4.19.1",
     "sonner": "^2.0.8",
     "tailwind-merge": "^3.6.0",
-    "temporalio": "^1.9.3",
     "tw-animate-css": "^1.4.0"
   },
   "devDependencies": {

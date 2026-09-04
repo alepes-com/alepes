@@ -14,7 +14,9 @@
     "@alepes/integration-runtime": "workspace:*",
     "@alepes/mock-brokerage": "workspace:*",
     "@alepes/persistence": "workspace:*",
-    "temporalio": "^1.9.3"
+    "@temporalio/workflow": "1.20.1",
+    "@temporalio/worker": "1.20.1",
+    "@temporalio/testing": "1.20.1"
   },
   "devDependencies": {
     "@types/node": "^20",

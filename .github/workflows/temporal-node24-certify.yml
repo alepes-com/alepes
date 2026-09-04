@@ -1,0 +1,111 @@
+# Temporal step-5 runtime certification.
+#
+# Alepes's platform/toolchain is Bun 1.4; Node 24 is a NARROW runtime island
+# required by Temporal's Worker and its workflow-isolate (V8 promiseHooks).
+# This job proves the Temporal workflow-isolate suite actually executes under
+# Node 24 (not merely typechecks), against real PostgreSQL test databases.
+#
+# The suite under test includes the two "effectively-once" proofs that are the
+# whole reason Alepes adopted Temporal:
+#   - retry after lost acknowledgement -> one financial effect
+#   - duplicate outbox redelivery -> one logical workflow
+#
+# A green row here certifies the Node 24 runtime for Temporal; it does NOT
+# change Bun's role for installation, the web/API, analytics+DuckDB, Oxlint,
+# or ordinary tests.
+
+name: temporal-node24-certify
+
+on:
+  push:
+    paths:
+      - "package.json"
+      - "bun.lock"
+      - "packages/temporal-workflows/**"
+      - "packages/persistence/**"
+      - ".github/workflows/temporal-node24-certify.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: temporal-node24-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  certify-temporal:
+    name: temporal workflow isolate (ubuntu, Node 24)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: alepes
+          POSTGRES_PASSWORD: alepes
+          POSTGRES_DB: alepes
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U alepes"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bun 1.4 is the pinned toolchain and installs dependencies.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      # Node 24 is the Temporal Worker / workflow-isolate runtime.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Record runtime versions
+        run: |
+          echo "bun: $(bun --version)"
+          echo "node: $(node --version)"
+          node -e "const n=process.versions.node; if(!/^24\./.test(n)){ console.error('Node 24 required, got '+n); process.exit(1) } console.log('Node 24 confirmed:', n)"
+
+      - name: Install dependencies (Bun 1.4)
+        run: bun install --frozen-lockfile
+
+      - name: Provision PostgreSQL test databases
+        run: |
+          export PGPASSWORD=alepes
+          psql -h localhost -U alepes -d alepes -c "SELECT 1" >/dev/null
+          for db in alepes_persistence_test alepes_temporal_test alepes_temporal_workflow_test; do
+            psql -h localhost -U alepes -d alepes -tc \
+              "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1 \
+              || psql -h localhost -U alepes -d alepes -c "CREATE DATABASE $db"
+          done
+          echo "provisioned: alepes_persistence_test, alepes_temporal_test, alepes_temporal_workflow_test"
+
+      - name: Run Temporal workflow-isolate suite under Node 24
+        env:
+          ALEPES_TEST_DATABASE_URL: postgresql://alepes:alepes@localhost:5432/alepes_persistence_test
+          ALEPES_TEST_TEMPORAL_DATABASE_URL: postgresql://alepes:alepes@localhost:5432/alepes_temporal_test
+          ALEPES_TEST_WORKFLOW_DATABASE_URL: postgresql://alepes:alepes@localhost:5432/alepes_temporal_workflow_test
+        run: |
+          # The suite MUST run under Node, not Bun: Temporal's workflow isolate
+          # depends on V8 promiseHooks. `vitest` resolves from the Bun-installed
+          # dependency tree, but is invoked through Node directly.
+          # --passWithNoTests=false: fail loudly if the env-guarded suite skips
+          # instead of executing.
+          npx vitest run packages/temporal-workflows/src/workflows.test.ts --passWithNoTests=false 2>&1 | tail -50
+
+      - name: Run persistence + activity integration tests (Node)
+        env:
+          ALEPES_TEST_DATABASE_URL: postgresql://alepes:alepes@localhost:5432/alepes_persistence_test
+          ALEPES_TEST_TEMPORAL_DATABASE_URL: postgresql://alepes:alepes@localhost:5432/alepes_temporal_test
+        run: |
+          npx vitest run packages/persistence packages/temporal-workflows/src/activities.test.ts 2>&1 | tail -40
+
+      - name: Full suite remains green (Bun interface)
+        run: bun test 2>&1 | tail -40
+
+      - name: Typecheck (Bun interface)
+        run: bunx tsc --noEmit
+
+      - name: Lint (Bun interface)
+        run: bunx oxlint

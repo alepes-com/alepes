@@ -36,6 +36,9 @@ construction (orders are always `buy`, never `sell`).
 | `@alepes/integration-runtime` | Capability / Plugin / Registry / CredentialProvider / Lifecycle. |
 | `@alepes/mock-bank` | Bank plugin: checking balance + deposits. |
 | `@alepes/mock-brokerage` | Brokerage plugin: portfolio + prices + order submission (records audit). |
+| `@alepes/persistence` | PostgreSQL persistence (plan + orders + append-only audit + transactional outbox). |
+| `@alepes/temporal-workflows` | Temporal orchestration layer (ExecutionPlanWorkflow + OutboxPublisherWorkflow). |
+| `@alepes/analytics` | Read-only analytics (DuckDB native API, confined by lint rule; never moves money). |
 
 ## Boundary discipline
 
@@ -53,8 +56,11 @@ construction (orders are always `buy`, never `sell`).
 ## Tests
 
 ```bash
-# from the repo root
-npx vitest run
+# from the repo root — Bun is the validation interface
+bun test
+bun run build
+bunx tsc --noEmit
+bunx oxlint
 ```
 
 The functional suite covers: allocations never exceed deployable; exact
@@ -71,3 +77,25 @@ Additional suites:
   every amount ≥ 0, sum ≤ deployable, sum === deployable when fully allocatable.
 - `packages/integration-conformance/src/conformance.ts` — reusable certification
   harness; certify any bank/brokerage plugin against its capability contract.
+
+## Runtime boundary
+
+Alepes has exactly one platform/toolchain and one narrow runtime island:
+
+- **Bun 1.4** (pinned via `packageManager`) is the Alepes platform: dependency
+  installation, scripts/tooling, the Next.js web/API, DuckDB analytics, Oxlint,
+  and ordinary tests.
+- **Node 24** (pinned via `.node-version`) is a narrow runtime dependency
+  required **only** by the Temporal Worker and the Temporal workflow-isolate
+  test suite. Temporal executes workflow code in a V8 isolate that depends on
+  `promiseHooks`, which Bun does not implement.
+
+This is **not** a second package-management ecosystem: there is no `npm` or
+`pnpm` path. Dependencies are installed with Bun; the Temporal suite is invoked
+through Node directly from the same Bun-installed dependency tree.
+
+Temporal SDK safety: `@temporalio/*` is pinned to `1.20.1` (the first release
+with the `webpack >= 5.108` workflow-context-isolation fix, issue #2170), and the
+worker runs with `reuseV8Context: false` — Alepes has not separately
+stress-certified V8 context reuse, so it stays off by construction for a
+financial system.

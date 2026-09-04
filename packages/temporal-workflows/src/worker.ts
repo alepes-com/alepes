@@ -54,6 +54,13 @@ export async function startWorker(opts: WorkerOptions): Promise<Worker> {
     namespace: "default",
     taskQueue: TASK_QUEUE,
     workflowsPath: require.resolve("./workflows"),
+    // Conservative runtime choice for a financial system: keep V8 context
+    // reuse OFF. reuseV8Context defaults to true since SDK 1.9.0, and although
+    // 1.20.1 fixes the webpack>=5.108 module-cache isolation bug (issue #2170),
+    // Alepes has not separately stress-certified the context-reuse path. Explicitly
+    // disabling it eliminates cross-workflow module-level state leakage by
+    // construction and is the documented safe default until such certification.
+    reuseV8Context: false,
     activities: {
       loadPlan,
       verifyPlan,
