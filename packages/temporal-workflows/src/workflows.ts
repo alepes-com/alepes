@@ -5,6 +5,7 @@ import type {
   ExecutionResult,
   ExecuteOrdersInput,
   ExecuteOrdersOutput,
+  ExpectedProvenance,
   LoadPlanOutput,
   OutboxClaimMsg,
   ReconcileInput,
@@ -56,6 +57,7 @@ const {
 export async function executionPlanWorkflow(
   planId: string,
   opts: ExecutionOptions,
+  expected?: ExpectedProvenance,
   outboxEventId?: string
 ): Promise<ExecutionResult> {
   const workflowId = executionWorkflowId(planId);
@@ -77,11 +79,16 @@ export async function executionPlanWorkflow(
     return { planId, result: { kind: "skipped-already-failed" }, filledCents: 0, brokerageCalls: 0, idempotencyKey };
   }
 
-  // 2) Verify provenance and snapshot hash
+  // 2) Verify provenance against the *independent* expected identity carried on
+  // the outbox event (not against the row we just loaded). If the publisher
+  // provided no expected provenance, fall back to the loaded row's own values
+  // only to preserve behaviour for direct (non-outbox) invocations.
+  const expectedCalc = expected?.calculationVersion ?? prov.calculationVersion;
+  const expectedHash = expected?.inputSnapshotHash ?? prov.inputSnapshotHash;
   const verification = await verifyPlan({
     planId,
-    expectedCalculationVersion: prov.calculationVersion,
-    expectedInputSnapshotHash: prov.inputSnapshotHash,
+    expectedCalculationVersion: expectedCalc,
+    expectedInputSnapshotHash: expectedHash,
   });
 
   if (!verification.valid) {
@@ -222,10 +229,25 @@ export async function outboxPublisherWorkflow(
 
     for (const claim of claims) {
       if (claim.type === "ExecutionPlanCreated") {
-        const payload = claim.payload as { planId?: unknown; shadow?: unknown };
+        const payload = claim.payload as {
+          planId?: unknown;
+          shadow?: unknown;
+          inputSnapshotHash?: unknown;
+          calculationVersion?: unknown;
+        };
         const planId = String(payload.planId);
         const shadow = Boolean(payload.shadow);
-        await executionPlanWorkflow(planId, { shadow }, claim.id);
+        // Forward independent expected provenance only when both fields are
+        // present; otherwise the workflow falls back to self-verification.
+        const expected: ExpectedProvenance | undefined =
+          typeof payload.inputSnapshotHash === "string" &&
+          typeof payload.calculationVersion === "string"
+            ? {
+                inputSnapshotHash: payload.inputSnapshotHash,
+                calculationVersion: payload.calculationVersion,
+              }
+            : undefined;
+        await executionPlanWorkflow(planId, { shadow }, expected, claim.id);
       } else {
         // Unknown event type: release so it doesn't block the queue
         await releaseOutboxClaim({ id: claim.id });

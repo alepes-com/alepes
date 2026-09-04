@@ -114,6 +114,16 @@ export interface OutboxClaimMsg {
   payload: Record<string, unknown>;
 }
 
+/**
+ * Independent expected provenance carried on the outbox event. The publisher
+ * forwards it into the workflow so verification compares against a canonical
+ * identity source, not against the plan row loaded moments earlier.
+ */
+export interface ExpectedProvenance {
+  inputSnapshotHash: string;
+  calculationVersion: string;
+}
+
 export interface ExecutionOptions {
   shadow: boolean;
 }

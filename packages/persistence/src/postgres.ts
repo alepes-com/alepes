@@ -125,7 +125,18 @@ class PostgresExecutionRepository {
 
       await client.query(
         `INSERT INTO ${TABLE_OUTBOX} (id, type, payload) VALUES ($1, $2, $3)`,
-        [ulidOf(), "ExecutionPlanCreated", JSON.stringify({ planId: persistedPlanId })]
+        [
+          ulidOf(),
+          "ExecutionPlanCreated",
+          JSON.stringify({
+            planId: persistedPlanId,
+            // Independent expected provenance — the publisher passes these into
+            // the workflow so verifyPlan compares the freshly-loaded persisted
+            // row against this canonical identity, not against itself.
+            inputSnapshotHash: input.inputSnapshotHash,
+            calculationVersion: input.calculationVersion,
+          }),
+        ]
       );
 
       await client.query("COMMIT");

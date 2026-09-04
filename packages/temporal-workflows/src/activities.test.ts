@@ -30,7 +30,10 @@ const TEST_CONNECTION =
   process.env.ALEPES_TEST_TEMPORAL_DATABASE_URL ??
   "postgresql://raelldottin@localhost:5432/alepes_temporal_test";
 
-const runIntegration = process.env.ALEPES_TEST_TEMPORAL_DATABASE_URL ? describe.sequential : describe.skip;
+// Tests within a single vitest file run sequentially by default; no
+// `describe.sequential` is needed (it does not exist in vitest 4). We skip the
+// whole suite when no PostgreSQL test database is configured.
+const runIntegration = process.env.ALEPES_TEST_TEMPORAL_DATABASE_URL ? describe : describe.skip;
 
 runIntegration("temporal activity integration (real PG)", () => {
   let ports: ReturnType<typeof createPostgresPorts>;
