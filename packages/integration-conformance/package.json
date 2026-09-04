@@ -11,6 +11,7 @@
     "@alepes/execution-policy": "*",
     "@alepes/integration-runtime": "*",
     "@alepes/mock-bank": "*",
-    "@alepes/mock-brokerage": "*"
+    "@alepes/mock-brokerage": "*",
+    "@alepes/mock-financial-data": "*"
   }
 }

@@ -32,6 +32,10 @@ alias["@alepes/mock-brokerage"] = path.resolve(
   dirname,
   "./packages/integrations/mock-brokerage/src/index.ts"
 );
+alias["@alepes/mock-financial-data"] = path.resolve(
+  dirname,
+  "./packages/integrations/mock-financial-data/src/index.ts"
+);
 
 export default defineConfig({
   plugins: [react()],
