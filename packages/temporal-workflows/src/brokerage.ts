@@ -22,25 +22,54 @@ export interface BrokerageResult {
 }
 
 /**
- * Mock brokerage executor backed by @alepes/mock-brokerage in-memory plugin.
- * For Temporal tests we usually swap in a spy implementing the same interface.
- * NOTE: this is invoked by the Temporal activity layer with policy-gated orders.
+ * A mock brokerage executor that models the exactly-once contract a real
+ * brokerage provides through `idempotencyKey`.
+ *
+ * - The first `executeOrders` for a given key records one fill for that key.
+ * - A later `executeOrders` that repeats an already-filled key returns the
+ *   SAME fill without double-counting (this is what makes a Temporal replay /
+ *   activity-retry safe: the boundary, not the workflow, dedups).
+ *
+ * `calls` counts *invocations* (how many times `executeOrders` ran), while
+ * `fillCountByKey` counts *financial effects* (how many fills were actually
+ * recorded per key). The "effectively-once" invariant is
+ * `fillCountByKey(k) === 1` even when `calls > 1`.
  */
-export function createMockBrokerageExecutor(): BrokerageExecutor & { calls: number } {
+export function createMockBrokerageExecutor(): BrokerageExecutor & {
+  /** Invocation count (may exceed the number of financial effects). */
+  calls: number;
+  /** Fills actually recorded, keyed by idempotency key. */
+  fillsByKey: Map<string, FilledOrder>;
+} {
   let calls = 0;
+  const fillsByKey = new Map<string, FilledOrder>();
+
   return {
-    calls,
+    get calls() {
+      return calls;
+    },
+    fillsByKey,
     async executeOrders(orders) {
       calls += 1;
-      const fills: FilledOrder[] = orders.map((o) => ({
-        orderId: o.id,
-        symbol: o.symbol,
-        filledCents: o.amountCents,
-        filledShares: o.shares,
-        filledAt: new Date(0).toISOString(),
-        idempotencyKey: o.idempotencyKey,
-      }));
-      return { ok: true, fills, calls: 1 };
+      const fills: FilledOrder[] = orders.map((o) => {
+        const key = o.idempotencyKey;
+        const prior = fillsByKey.get(key);
+        if (prior) {
+          // Already filled once — replay/retry returns the existing effect.
+          return prior;
+        }
+        const fill: FilledOrder = {
+          orderId: o.id,
+          symbol: o.symbol,
+          filledCents: o.amountCents,
+          filledShares: o.shares,
+          filledAt: new Date(0).toISOString(),
+          idempotencyKey: key,
+        };
+        fillsByKey.set(key, fill);
+        return fill;
+      });
+      return { ok: true, fills, calls };
     },
   };
 }
