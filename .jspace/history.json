@@ -1,1 +1,0 @@
-[{"t": 1788375719, "next": "Implement atomicity + Temporal workflow + 10 test cases", "verified": 1, "open": 0}, {"t": 1788398832, "next": "Create bun branch, run bun install, verify bun test against vitest suite", "verified": 1, "open": 0}]
