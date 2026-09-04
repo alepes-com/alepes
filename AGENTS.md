@@ -122,9 +122,9 @@ invariants:
   Shadow Mode is the default disposition. Do not label a simulated or mocked
   result as a real-money result. (See Proof, below.)
 - **The ledger types** (`AuditRecord`, `LedgerEntry`) are the intended form of the
-  immutable trail. There is **no persistence layer yet** — these are in-memory
-  typed structures. Do not claim a database, a queue, or durable storage exists
-  until one is actually added.
+  immutable trail. Persistence is provided by `@alepes/persistence` (PostgreSQL —
+  plan + orders + append-only audit + transactional outbox), and orchestration by
+  `@alepes/temporal-workflows` (Temporal Worker + workflow isolate).
 
 There are currently **no** markers of this repo implementing: fees, dividends,
 stock splits, multi-currency, or historical price series. Do not invent rules for
@@ -207,7 +207,7 @@ Because only levels 1–4 exist here, hard caps apply:
 
 - A unit test does **not** prove a real bank/brokerage/API worked.
 - A mock or sandbox result does **not** prove real settlement.
-- `npm run build` passing does **not** prove runtime correctness.
+- `bun run build` passing does **not** prove runtime correctness.
 - A UI rendering does **not** prove canonical state is correct.
 - A successful `next` HTTP page does **not** prove a financial decision was right.
 
@@ -275,19 +275,20 @@ of an unrelated feature or bug fix.
 
 ## Validation ladder (real commands)
 
-Run these in order; each is a real, working command in this repo:
+Run these in order; each is a real, working command in this repo. Bun 1.4 is the
+validation interface; Oxlint is the primary linter.
 
 ```bash
-npm run lint          # eslint (Next config)
-npx tsc --noEmit      # typecheck the whole repo (src + packages)
-npm test              # vitest — 93 tests across packages + UI facades
-npm run build         # Next production build (static prerender of all routes)
-git diff --check      # whitespace errors
+bun run lint         # oxlint (0 errors required)
+bunx tsc --noEmit    # typecheck the whole repo (src + packages)
+bun test             # vitest unit/property/conformance tests
+bun run build        # Next production build (static prerender of all routes)
+git diff --check     # whitespace errors
 ```
 
-There is no `make`, no CI workflow, and no formatting-only tool beyond eslint.
-If a broader pre-release check is needed, it is a tooling gap — say so rather than
-implying one exists.
+Persistence and Temporal have integration suites that require a live PostgreSQL
+(or the Temporal workflow isolate under Node 24) and run only when their env vars
+are set — see the CI workflows (`.github/workflows/`) and the packages README.
 
 ---
 
@@ -304,6 +305,146 @@ implying one exists.
 changes), `tsconfig.json` and `vitest.config.mts` (the `@alepes/*` alias lists,
 which must stay in sync with each other and with the `packages/` tree),
 `src/lib/data/mock.ts` (shared mock data), and this `AGENTS.md`.
+
+---
+
+## Repository and release workflow
+
+### Branching model
+
+`main` is the protected, releasable branch. There is no permanent `dev` branch.
+
+Normal development happens on short-lived branches named by type:
+
+- `feat/<name>` — e.g. `feat/plaid-readonly`, `feat/schwab-readonly`
+- `fix/<name>` — e.g. `fix/execution-idempotency`
+- `refactor/<name>` — e.g. `refactor/provider-capabilities`
+- `chore/<name>` — e.g. `chore/temporal-runtime-cert`
+
+Routine feature and fix work must not be committed directly to `main`. The normal
+flow is:
+
+```
+issue / milestone
+→ short-lived branch
+→ implementation
+→ local verification
+→ commit
+→ push branch
+→ pull request into main
+→ required CI
+→ review
+→ merge
+→ main remains releasable
+```
+
+Do not create or maintain a long-lived `dev` branch unless a future
+release-management requirement explicitly justifies one.
+
+### Pull requests and merge discipline
+
+After this policy is introduced, stop using `commit → push main` for routine
+product work. Use:
+
+```
+create branch → commit → push branch → PR → CI → merge
+```
+
+- Tags and releases must only point to commits already merged into `main`.
+- Never create a release tag from a feature branch.
+- Prefer normal fast-forward/PR workflows. Do not force-push shared branches
+  unless explicitly authorized.
+- Keep commits logically scoped, and push unrelated changes separately.
+- Use Conventional Commit-style subjects where practical: `feat:`, `fix:`,
+  `refactor:`, `chore:`, `test:`, `docs:`.
+
+### Semantic versioning
+
+Alepes uses Semantic Versioning with a `v`-prefixed Git tag. While pre-1.0, use
+`v0.MINOR.PATCH`:
+
+- **MINOR** — meaningful product capability, architectural contract, provider
+  capability, or intentional breaking internal evolution.
+- **PATCH** — bug fix, safety hardening, reliability improvement, or a
+  documentation correction that does not introduce a new capability milestone.
+
+Do not create a version tag for every commit — tag milestone-worthy states only.
+
+The first baseline release is **`v0.1.0`**, the Alepes platform foundation after
+the Temporal Node 24 runtime certification is merged and validated.
+
+Directional progression (not permission to implement automatically):
+
+- `v0.1.0` — platform foundation
+- `v0.2.0` — bank data / Plaid read-only
+- `v0.3.0` — brokerage read-only
+- `v0.4.0` — real-account Shadow Mode
+- later — sandbox/live execution capabilities as deliberately approved
+
+### Release candidates
+
+Pre-release identifiers are appropriate once financial execution becomes involved:
+`v0.6.0-alpha.1`, `v0.6.0-beta.1`, `v0.6.0-rc.1`, then `v0.6.0`. Before `v1.0.0`,
+prefer release-candidate validation for any release that can move money or submit
+securities orders.
+
+### Git tagging
+
+Create annotated tags from `main` only. Canonical form: `vX.Y.Z`.
+
+```bash
+git tag -a v0.1.0 -m "Alepes v0.1.0 — platform foundation"
+```
+
+Then push the tag normally. A GitHub Release corresponds exactly to a release tag.
+Do not tag a commit until its `main` CI is green.
+
+### Release baseline
+
+Once the Node 24 Temporal runtime-certification milestone is merged and validated,
+tag that exact `main` commit as `v0.1.0`. That tag ends foundation-building and
+begins provider/product capability development. The next provider work begins from
+a short-lived branch (e.g. `feat/plaid-readonly`), not directly on `main`.
+
+### Runtime/toolchain policy
+
+- **Bun 1.4** is the repository toolchain and default runtime: dependency
+  installation, ordinary scripts, web/API, DuckDB analytics, Oxlint, and normal
+  repo validation.
+- **Node 24** is a narrow runtime exception for the Temporal Worker and
+  workflow-isolate tests only.
+- Do not introduce npm or pnpm as alternate package-management workflows;
+  `packageManager` remains Bun 1.4.
+- Native DuckDB remains confined to the analytics package.
+- PostgreSQL remains the transactional authority.
+
+### Validation before PR/merge
+
+Before a PR is considered mergeable, run the validation appropriate to the changed
+area. The full repository validation floor is: pinned Bun version; TypeScript
+clean; Oxlint 0 errors; unit/property/conformance tests; PostgreSQL integration
+tests when persistence is affected; Node 24 Temporal workflow-isolate tests when
+Temporal is affected; DuckDB certification/analytics tests when analytics runtime
+behavior is affected; Next build; and `git diff --check`. CI must enforce the
+corresponding checks before merge to `main`.
+
+### Agent behavior
+
+Agents working in this repository must:
+
+- inspect `AGENTS.md` before repository changes;
+- preserve established architecture unless explicitly changing it;
+- create a short-lived branch for normal product work;
+- avoid direct pushes to `main` for routine changes;
+- stop before tagging/releasing unless the milestone actually satisfies the
+  documented release criteria;
+- never infer permission to begin Plaid, Schwab, money movement, or live trading
+  merely because a previous milestone was merged;
+- keep unrelated changes out of the same commit; and
+- report branch, commit SHA, validation results, and PR/merge state at handoff.
+
+If an instruction from the user explicitly overrides this workflow for a specific
+task, follow the user's instruction and record the deviation clearly.
 
 ---
 
