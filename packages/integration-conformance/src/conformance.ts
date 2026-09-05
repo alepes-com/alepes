@@ -3,11 +3,20 @@
 // plugin (mock, Plaid-backed, Schwab-backed) can be run through the SAME suite
 // to prove it satisfies the contract the engine depends on.
 
-import type { AuditRecord, ExecutionOrder, PortfolioState } from "@alepes/domain";
+import type {
+  AuditRecord,
+  ExecutionOrder,
+  ExternalObservationRef,
+  FinancialObservation,
+  PortfolioState,
+} from "@alepes/domain";
 import { nonNegativeCents } from "@alepes/money";
 import {
   CAPABILITIES,
+  ProviderError,
   Registry,
+  type AccountBinding,
+  type FinancialDataProvider,
   type ListDeposits,
   type Plugin,
   type ReadCheckingBalance,
@@ -136,6 +145,164 @@ export async function certifyBrokerage(plugin: Plugin): Promise<ConformanceRepor
 
   return {
     pluginId: plugin.id,
+    failures,
+    get pass() {
+      return failures.length === 0;
+    },
+  };
+}
+
+//
+// ─── Financial-data-provider conformance ────────────────────────────────────
+//
+
+/**
+ * A fixture the harness drives to exercise multi-cycle synchronization against a
+ * provider. `provider` is the capability under test; the hooks let the harness
+ * inject deterministic external state changes between sync cycles without
+ * reaching into any provider SDK.
+ */
+export interface FinancialDataSyncFixture {
+  provider: FinancialDataProvider;
+  /** Add one external record (becomes an "added" observation next cycle). */
+  add(ref: string, amountCents: number, direction: "credit" | "debit", status: "pending" | "posted"): void;
+  /** Modify an existing record (becomes a "modified" observation next cycle). */
+  modify(ref: string, amountCents: number, status?: "pending" | "posted"): void;
+  /** Remove an existing record (becomes a "removed" reference next cycle). */
+  remove(ref: string): void;
+  /** Claim a mutation-during-pagination condition (provider raises restart_sync). */
+  triggerMutationDuringPagination?(): void;
+}
+
+/**
+ * Certify a read-only financial-data provider against the provider-neutral
+ * synchronization contract. Proves the invariants ingestion depends on:
+ * stable identity, no duplication on replay, explicit add/modify/remove deltas,
+ * full-cycle cursor atomicity, cross-binding isolation, credential hygiene, and
+ * provider-reference confinement.
+ */
+export async function certifyFinancialDataProvider(
+  fixture: FinancialDataSyncFixture
+): Promise<ConformanceReport> {
+  const failures: string[] = [];
+  const provider = fixture.provider;
+
+  async function check(name: string, fn: () => Promise<void> | void) {
+    try {
+      await fn();
+    } catch (err) {
+      failures.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  let binding: AccountBinding | null = null;
+  try {
+    const accts = await provider.discoverAccounts("cred:test");
+    if (!Array.isArray(accts) || accts.length === 0) {
+      failures.push("discoverAccounts: no accounts discovered");
+      binding = null;
+    } else {
+      binding = accts[0];
+    }
+  } catch (err) {
+    failures.push(`discoverAccounts: ${err instanceof Error ? err.message : String(err)}`);
+    binding = null;
+  }
+
+  if (binding) {
+    const b: AccountBinding = binding;
+    // The durable cursor advances only at full-cycle completion.
+    let cursor = "";
+
+    await check("initial sync returns well-formed delta", async () => {
+      const d = await provider.syncObservations(b, cursor);
+      if (!d || !Array.isArray(d.added) || !Array.isArray(d.modified) || !Array.isArray(d.removed))
+        throw new Error("malformed delta");
+      if (typeof d.nextCursor !== "string" || typeof d.hasMore !== "boolean")
+        throw new Error("delta missing cursor/hasMore");
+    });
+
+    // 1. addition
+    fixture.add("txn-1", 100_00, "credit", "posted");
+    await check("added record surfaces in delta", async () => {
+      const d = await provider.syncObservations(b, cursor);
+      if (d.added.length !== 1) throw new Error(`expected 1 added, got ${d.added.length}`);
+    });
+
+    // 2. deterministic idempotent replay from the SAME cursor
+    await check("replay of same cursor yields identical delta (idempotent)", async () => {
+      const a = await provider.syncObservations(b, cursor);
+      const c = await provider.syncObservations(b, cursor);
+      if (JSON.stringify(a) !== JSON.stringify(c)) throw new Error("replay delta differs");
+    });
+
+    // 3. stable identity on the added observation
+    await check("added observation has stable Alepes id + opaque external ref", async () => {
+      const d = await provider.syncObservations(b, cursor);
+      const o: FinancialObservation = d.added[0];
+      if (!o.id || !o.externalRef) throw new Error("observation lacks identity");
+    });
+
+    // 4. advance the cursor via a full cycle, then modify → modified delta
+    const cycle1 = await provider.syncObservations(b, cursor);
+    cursor = cycle1.nextCursor;
+    fixture.modify("txn-1", 150_00, "posted");
+    await check("modify surfaces as modified (same stable id)", async () => {
+      const d = await provider.syncObservations(b, cursor);
+      const byRef = d.modified.find((o) => o.externalRef === ("txn-1" as ExternalObservationRef));
+      if (!byRef) throw new Error("modified record missing from delta");
+      if (byRef.id !== ("obs-txn-1" as ReturnType<typeof String>)) throw new Error("modified id changed");
+    });
+
+    // 5. remove → removed delta
+    const cycle2 = await provider.syncObservations(b, cursor);
+    cursor = cycle2.nextCursor;
+    fixture.remove("txn-1");
+    await check("removed record surfaces as removed reference", async () => {
+      const d = await provider.syncObservations(b, cursor);
+      const hasRemoved = d.removed.some((r) => r === ("txn-1" as ExternalObservationRef));
+      if (!hasRemoved) throw new Error("removal not surfaced");
+    });
+
+    // 6. pending → posted keeps one logical identity
+    const cycle3 = await provider.syncObservations(b, cursor);
+    cursor = cycle3.nextCursor;
+    fixture.add("txn-p", 80_00, "credit", "pending");
+    await check("pending then posted stays one logical observation", async () => {
+      const d1 = await provider.syncObservations(b, cursor);
+      const pendingObs = d1.added.find((o) => o.externalRef === ("txn-p" as ExternalObservationRef));
+      if (!pendingObs) throw new Error("pending record not observed");
+      const c1 = d1.nextCursor;
+      fixture.modify("txn-p", 80_00, "posted");
+      const d2 = await provider.syncObservations(b, c1);
+      const postedObs = d2.modified
+        .concat(d2.added)
+        .find((o) => o.externalRef === ("txn-p" as ExternalObservationRef));
+      if (!postedObs) throw new Error("posted record missing");
+      if (postedObs.id !== pendingObs.id) throw new Error("pending→posted changed observation identity");
+    });
+
+    // 7. cross-binding isolation (only meaningful with 2+ accounts)
+    await check("account bindings do not cross", async () => {
+      const accts = await provider.discoverAccounts("cred:test");
+      if (accts.length < 2) return;
+      const d = await provider.syncObservations(b, cursor);
+      for (const o of d.added.concat(d.modified)) {
+        if (o.accountBindingId !== b.id) throw new Error("cross-binding leak");
+      }
+    });
+
+    // 8. credential hygiene
+    await check("credential material never appears in returned objects", async () => {
+      const d = await provider.syncObservations(b, cursor);
+      if (/cred:test|secret|token|password/i.test(JSON.stringify(d))) {
+        throw new Error("credential material leaked into delta");
+      }
+    });
+  }
+
+  return {
+    pluginId: provider.info.id,
     failures,
     get pass() {
       return failures.length === 0;

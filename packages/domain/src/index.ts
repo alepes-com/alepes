@@ -4,7 +4,223 @@
 
 import type { Cents, NonNegativeCents } from "@alepes/money";
 
-/** A single holding with a target allocation and optional band. */
+//
+// ─── Provider-normalized financial observations ─────────────────────────────
+//
+// Alepes owns these types. A financial-data provider (Plaid, a mock, …) exposes
+// *observations* of external activity; Alepes interprets them and, only when an
+// observation qualifies as incoming cash, derives a `CashEvent`.
+//
+// The stages are kept explicit and distinct:
+//   1. provider delta            (add / modify / remove — see ObservationSyncDelta)
+//   2. normalized observation    (provider facts only; sign convention resolved)
+//   3. financial interpretation  (Alepes classifies into incoming/outgoing/…)
+//   4. CashEvent qualification   (a qualifying incoming-cash observation only)
+//
+// `CashEvent` is deliberately NOT the ingestion primitive: it sits downstream of
+// the normalized observation + reconciliation layer so that pending→posted
+// transitions, corrections, and removals never cause a double financial effect.
+//
+
+/**
+ * An opaque, provider-issued reference to one external record (e.g. a Plaid
+ * transaction_id). It is confined to the integration adapter, account-binding
+ * persistence, and the reconciliation layer. It MUST NOT leak into rules,
+ * allocation, execution policy, `CashEvent`, or capital/execution plans.
+ */
+export type ExternalObservationRef = string & { readonly __externalRef: unique symbol };
+
+/**
+ * A durable, Alepes-minted identity for a normalized observation. Distinct from
+ * the provider's external reference: this is what Alepes persists and keys its
+ * own history on, while `externalRef` holds the provider-side link.
+ */
+export type FinancialObservationId = string & { readonly __observationId: unique symbol };
+
+/**
+ * The provider-normalized direction of a record, already resolved into Alepes's
+ * sign convention. The adapter is responsible for converting any provider's own
+ * convention (e.g. Plaid's inverted sign) into this at the boundary — the domain
+ * never sees the provider's raw sign semantics.
+ */
+export type ObservationDirection = "credit" | "debit";
+
+/** The posting status of an observation, mirroring provider-timing semantics. */
+export type ObservationStatus = "pending" | "posted";
+
+/**
+ * A provider-neutral, normalized observation of one external financial record.
+ * This carries facts only — amount/direction/status/timing — and deliberately
+ * does NOT classify the record's financial meaning. Classification is a separate
+ * Alepes-owned interpretation step.
+ */
+export interface FinancialObservation {
+  /** Durable Alepes-owned identity (minted at normalization/persistence). */
+  id: FinancialObservationId;
+  /** Opaque provider reference; integration/reconciliation layer only. */
+  externalRef: ExternalObservationRef;
+  /** The Alepes account binding this observation belongs to. */
+  accountBindingId: string;
+  /**
+   * Signed amount in integer cents in ALEPES convention: credit (money in) is
+   * positive, debit (money out) is negative. The adapter has already resolved
+   * the provider's own sign convention into this.
+   */
+  amountCents: Cents;
+  direction: ObservationDirection;
+  status: ObservationStatus;
+  /** ISO-8601 timestamp the provider first reported this record. */
+  firstObservedAt: string;
+  /** ISO-8601 timestamp the record became authoritative/posted (if posted). */
+  postedAt?: string;
+  /** Human-readable description rooted in provider data (display only). */
+  description: string;
+  /**
+   * Opaque provider-issued predecessor/supersession reference, when the provider
+   * links this record to a prior one (e.g. pending → posted). Only the
+   * reconciliation layer interprets it; it is never an Alepes identity.
+   */
+  predecessorRef?: ExternalObservationRef;
+  /** The normalization version that produced this observation. */
+  normalizationVersion: string;
+}
+
+/**
+ * A provider-neutral account balance snapshot, captured separately from any
+ * transaction observation. Providers (e.g. Plaid) report account balance data
+ * alongside transactions; it is NOT a historical "balance immediately after this
+ * transaction". The snapshot carries its own capture-time and whether the value
+ * is provider-cached vs real-time, so downstream consumers know the freshness.
+ */
+export interface AccountBalanceSnapshot {
+  /** The Alepes account binding this balance belongs to. */
+  accountBindingId: string;
+  /** The available balance, when the provider reports one (integer cents). */
+  availableCents?: NonNegativeCents;
+  /** The current/ledger balance (integer cents). Always present. */
+  currentCents: NonNegativeCents;
+  /** ISO-8601 timestamp the provider captured this balance. */
+  capturedAt: string;
+  /** True when the provider supplied a cached (not real-time) balance. */
+  isCachedByProvider: boolean;
+  /** The normalization version that produced this snapshot. */
+  normalizationVersion: string;
+}
+
+/**
+ * Select the balance to use for qualification from a snapshot: the available
+ * balance when present, otherwise the current balance. Pure and deterministic.
+ * This is the ONLY place the "available ?? current" rule lives.
+ */
+export function selectAccountBalance(snapshot: AccountBalanceSnapshot): NonNegativeCents {
+  return snapshot.availableCents ?? snapshot.currentCents;
+}
+
+/**
+ * A provider-neutral synchronization delta. Rather than a flat list that
+ * downstream code must diff against a previous snapshot, the provider explicitly
+ * partitions one sync cycle's changes into added / modified / removed. This is
+ * the lossless form the reconciliation layer consumes; the provider adapter
+ * guarantees each external change appears in exactly one bucket.
+ */
+export interface ObservationSyncDelta {
+  added: FinancialObservation[];
+  modified: FinancialObservation[];
+  /** Provider references of records that no longer exist (explicit removals). */
+  removed: ExternalObservationRef[];
+  /**
+   * The account balance snapshot reported alongside this sync cycle (account
+   * level, NOT a per-transaction "balance after"). When present, it is the
+   * balance used to qualify incoming-cash observations in this cycle.
+   */
+  accountBalance?: AccountBalanceSnapshot;
+  /** Opaque cursor/checkpoint to resume from on the NEXT cycle. */
+  nextCursor: string;
+  /** True when the provider reports further changes after this cycle. */
+  hasMore: boolean;
+}
+
+//
+// ─── Financial interpretation and CashEvent qualification ───────────────────
+//
+// The adapter normalizes provider FACTS. Alepes INTERPRETS them. These pure,
+// deterministic functions are that interpretation boundary: they classify a
+// normalized observation and, only when it qualifies as posted incoming cash,
+// derive a `CashEvent`. No provider-specific source logic (e.g. "this category
+// string means payroll") lives here yet — that is a later, explicitly-scoped
+// concern.
+//
+
+/** The Alepes financial meaning of a normalized observation. */
+export type ObservationInterpretation =
+  | { kind: "incoming_cash" }
+  | { kind: "outgoing_cash" }
+  | { kind: "transfer" }
+  | { kind: "reversal" }
+  | { kind: "unknown" };
+
+/**
+ * Deterministically interpret a normalized observation's financial meaning from
+ * its facts (direction + status + amount sign). Pure: same input → same output.
+ */
+export function interpretObservation(obs: FinancialObservation): ObservationInterpretation {
+  if (obs.status === "pending") {
+    // Pending records are NOT yet authoritatively classified as cash — they may
+    // still be corrected before posting. They stay unknown to the engine.
+    return { kind: "unknown" };
+  }
+  if (obs.direction === "credit") {
+    return obs.amountCents > 0 ? { kind: "incoming_cash" } : { kind: "unknown" };
+  }
+  if (obs.direction === "debit") {
+    return { kind: "outgoing_cash" };
+  }
+  return { kind: "unknown" };
+}
+
+/**
+ * Qualify an interpreted observation into a `CashEvent`, or return null.
+ *
+ * Only a POSTED incoming-cash interpretation qualifies. Pending records never
+ * become executable cash, so a pending→posted replacement yields at most one
+ * active CashEvent (the pending one never qualified in the first place).
+ *
+ * A `CashEvent` requires a checking balance to be well-formed. For provider-
+ * derived events the balance is the ACCOUNT balance snapshot captured at
+ * qualification/detection time (see `selectAccountBalance`), NOT a per-
+ * transaction "balance immediately after this transaction" — providers do not
+ * report that fact. `accountBalanceCents` is the already-resolved balance.
+ *
+ * `source` is a coarse, deterministic categorization and does NOT auto-select a
+ * specific financial rule; downstream rule evaluation keeps that decision.
+ */
+export function qualifyCashEvent(
+  obs: FinancialObservation,
+  interp: ObservationInterpretation,
+  accountBalanceCents: NonNegativeCents | undefined
+): CashEvent | null {
+  if (interp.kind !== "incoming_cash" || obs.status !== "posted") {
+    return null;
+  }
+  // A well-formed CashEvent requires an account balance. If no balance snapshot
+  // was captured, qualification is deferred rather than fabricating one — the
+  // observation stays normalized but is not yet executable cash.
+  if (accountBalanceCents === undefined) {
+    return null;
+  }
+  return {
+    id: obs.id,
+    amount: obs.amountCents,
+    source: "transfer",
+    description: obs.description,
+    occurredAt: obs.postedAt ?? obs.firstObservedAt,
+    checkingBalanceAfter: accountBalanceCents,
+  };
+}
+
+/**
+ * A single holding with a target allocation and optional band.
+ */
 export interface Holding {
   symbol: string;
   name: string;

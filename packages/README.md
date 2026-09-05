@@ -37,6 +37,7 @@ construction (orders are always `buy`, never `sell`).
 | `@alepes/mock-bank` | Bank plugin: checking balance + deposits. |
 | `@alepes/mock-brokerage` | Brokerage plugin: portfolio + prices + order submission (records audit). |
 | `@alepes/persistence` | PostgreSQL persistence (plan + orders + append-only audit + transactional outbox). |
+| `@alepes/reconciliation` | Provider-neutral sync orchestration + Shadow Mode composition (sync → reconcile → interpret → qualify → shadow disposition). |
 | `@alepes/temporal-workflows` | Temporal orchestration layer (ExecutionPlanWorkflow + OutboxPublisherWorkflow). |
 | `@alepes/analytics` | Read-only analytics (DuckDB native API, confined by lint rule; never moves money). |
 
@@ -56,12 +57,15 @@ construction (orders are always `buy`, never `sell`).
 ## Tests
 
 ```bash
-# from the repo root — Bun is the validation interface
-bun test
+# from the repo root — Bun is the validation interface (runs the `vitest run` script)
+bun run test
 bun run build
 bunx tsc --noEmit
 bunx oxlint
 ```
+
+> `bun run test` runs the repo's Vitest suite. `bun test` is Bun's own built-in
+> runner and is not the canonical Alepes test command.
 
 The functional suite covers: allocations never exceed deployable; exact
 reconciliation after rounding; no negative allocation; overweight holdings

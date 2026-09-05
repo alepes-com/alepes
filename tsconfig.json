@@ -27,9 +27,12 @@
       "@alepes/execution-policy": ["./packages/execution-policy/src/index.ts"],
       "@alepes/integration-runtime": ["./packages/integration-runtime/src/index.ts"],
       "@alepes/persistence": ["./packages/persistence/src/index.ts"],
+      "@alepes/reconciliation": ["./packages/reconciliation/src/index.ts"],
       "@alepes/temporal-workflows": ["./packages/temporal-workflows/src/index.ts"],
       "@alepes/mock-bank": ["./packages/integrations/mock-bank/src/index.ts"],
-      "@alepes/mock-brokerage": ["./packages/integrations/mock-brokerage/src/index.ts"]
+      "@alepes/mock-brokerage": ["./packages/integrations/mock-brokerage/src/index.ts"],
+      "@alepes/mock-financial-data": ["./packages/integrations/mock-financial-data/src/index.ts"],
+      "@alepes/plaid-financial-data": ["./packages/integrations/plaid-financial-data/src/index.ts"]
     }
   },
   "include": [

@@ -7,6 +7,7 @@ import { noDirectBrokerExecutionRule } from "./rules/no-direct-broker-execution.
 import { requireExecutionPolicyRule } from "./rules/require-execution-policy.ts";
 import { noNondeterminismInWorkflowRule } from "./rules/no-nondeterminism-in-workflow.ts";
 import { noDuckdbOutsideAnalyticsRule } from "./rules/no-duckdb-outside-analytics.ts";
+import { noPlaidOutsideAdapterRule } from "./rules/no-plaid-outside-adapter.ts";
 
 /** Alepes-specific rules that enforce financial-domain boundaries. */
 const alepesPlugin = eslintCompatPlugin({
@@ -19,6 +20,7 @@ const alepesPlugin = eslintCompatPlugin({
     "require-execution-policy": requireExecutionPolicyRule,
     "no-nondeterminism-in-workflow": noNondeterminismInWorkflowRule,
     "no-duckdb-outside-analytics": noDuckdbOutsideAnalyticsRule,
+    "no-plaid-outside-adapter": noPlaidOutsideAdapterRule,
   },
 });
 

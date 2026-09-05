@@ -15,6 +15,7 @@ const packages = [
   "execution-policy",
   "integration-runtime",
   "persistence",
+  "reconciliation",
   "temporal-workflows",
 ];
 const alias: Record<string, string> = {
@@ -31,6 +32,14 @@ alias["@alepes/mock-bank"] = path.resolve(
 alias["@alepes/mock-brokerage"] = path.resolve(
   dirname,
   "./packages/integrations/mock-brokerage/src/index.ts"
+);
+alias["@alepes/mock-financial-data"] = path.resolve(
+  dirname,
+  "./packages/integrations/mock-financial-data/src/index.ts"
+);
+alias["@alepes/plaid-financial-data"] = path.resolve(
+  dirname,
+  "./packages/integrations/plaid-financial-data/src/index.ts"
 );
 
 export default defineConfig({

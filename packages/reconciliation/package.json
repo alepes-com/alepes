@@ -1,0 +1,27 @@
+{
+  "name": "@alepes/reconciliation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@alepes/domain": "workspace:*",
+    "@alepes/money": "workspace:*",
+    "@alepes/integration-runtime": "workspace:*",
+    "@alepes/persistence": "workspace:*",
+    "@alepes/rules-engine": "workspace:*",
+    "@alepes/allocation-engine": "workspace:*",
+    "@alepes/execution-policy": "workspace:*"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.11",
+    "typescript": "^5"
+  }
+}
