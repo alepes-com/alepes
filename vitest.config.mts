@@ -36,6 +36,10 @@ alias["@alepes/mock-financial-data"] = path.resolve(
   dirname,
   "./packages/integrations/mock-financial-data/src/index.ts"
 );
+alias["@alepes/plaid-financial-data"] = path.resolve(
+  dirname,
+  "./packages/integrations/plaid-financial-data/src/index.ts"
+);
 
 export default defineConfig({
   plugins: [react()],

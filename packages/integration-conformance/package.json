@@ -12,6 +12,7 @@
     "@alepes/integration-runtime": "*",
     "@alepes/mock-bank": "*",
     "@alepes/mock-brokerage": "*",
-    "@alepes/mock-financial-data": "*"
+    "@alepes/mock-financial-data": "*",
+    "@alepes/plaid-financial-data": "*"
   }
 }
