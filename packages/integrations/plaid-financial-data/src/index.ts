@@ -9,6 +9,7 @@
 // package's public surface.
 
 import type {
+  AccountBalanceSnapshot,
   ExternalObservationRef,
   FinancialObservation,
   FinancialObservationId,
@@ -16,6 +17,7 @@ import type {
 } from "@alepes/domain";
 import {
   cents,
+  nonNegativeCents,
 } from "@alepes/money";
 import {
   ProviderError,
@@ -136,21 +138,23 @@ export function createPlaidFinancialDataProvider(
       return accounts.map((a, i) => ({
         id: `binding-${i + 1}`,
         providerAccountRef: a.accountId as ExternalObservationRef,
+        credentialRef,
         name: a.name,
         metadata: { subtype: "depository" },
       }));
     },
 
-    async bindAccount(_credentialRef: string, providerAccountRef: ExternalObservationRef): Promise<AccountBinding> {
+    async bindAccount(credentialRef: string, providerAccountRef: ExternalObservationRef): Promise<AccountBinding> {
       return {
         id: `binding-${providerAccountRef}`,
         providerAccountRef,
+        credentialRef,
         metadata: { subtype: "depository" },
       };
     },
 
     async syncObservations(binding: AccountBinding, cursor: string): Promise<ObservationSyncDelta> {
-      const accessToken = await resolveAccessToken("cred:test");
+      const accessToken = await resolveAccessToken(binding.credentialRef);
       let resp: { data: TransactionsSyncResponse };
       try {
         resp = await client.transactionsSync({ access_token: accessToken, cursor, ...(count ? { count } : {}) });
@@ -159,14 +163,47 @@ export function createPlaidFinancialDataProvider(
       }
 
       const data = resp.data;
+      // Normalize the account balance snapshot (account-level, NOT a per-transaction
+      // "balance after"). Plaid reports balances alongside account data; this is the
+      // balance used to qualify incoming-cash observations in this cycle. Selection
+      // of available-vs-current happens downstream in selectAccountBalance.
+      const accountBalance = normalizeAccountBalance(binding.id, data.accounts, PLAID_NORMALIZATION_VERSION);
       return {
         added: data.added.map((t) => toObservation(binding.id, t, PLAID_NORMALIZATION_VERSION)),
         modified: data.modified.map((t) => toObservation(binding.id, t, PLAID_NORMALIZATION_VERSION)),
         removed: data.removed.map((r: RemovedTransaction) => r.transaction_id as ExternalObservationRef),
+        ...(accountBalance ? { accountBalance } : {}),
         nextCursor: data.next_cursor,
         hasMore: data.has_more,
       };
     },
+  };
+}
+
+/**
+ * Pull an Alepes AccountBalanceSnapshot out of the Plaid response's `accounts`
+ * array (the first depository account). Returns undefined when no usable balance
+ * is present — qualification then defers rather than fabricating a balance.
+ */
+function normalizeAccountBalance(
+  bindingId: string,
+  accounts: Array<{ balances?: { available?: number | null; current?: number | null } | null }>,
+  normalizationVersion: string
+): AccountBalanceSnapshot | undefined {
+  const acct = accounts.find((a) => a?.balances && (a.balances.current != null || a.balances.available != null));
+  if (!acct?.balances) return undefined;
+  const current = acct.balances.current;
+  if (current == null && acct.balances.available == null) return undefined;
+  return {
+    accountBindingId: bindingId,
+    ...(acct.balances.available != null
+      ? { availableCents: nonNegativeCents(Math.round(acct.balances.available * 100)) }
+      : {}),
+    currentCents: nonNegativeCents(Math.round((current ?? acct.balances.available!) * 100)),
+    capturedAt: new Date().toISOString(),
+    // Balances returned alongside /transactions/sync are cached by the provider.
+    isCachedByProvider: true,
+    normalizationVersion,
   };
 }
 
@@ -198,4 +235,5 @@ export {
   syncResponse,
   incomingPlaidTransaction,
   outgoingPlaidTransaction,
+  plaidAccountWithBalances,
 } from "./fixtures";

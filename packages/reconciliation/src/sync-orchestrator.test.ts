@@ -13,6 +13,7 @@ import type {
   ReconcileSyncCycleInput,
   ReconcileSyncCycleResult,
 } from "@alepes/persistence";
+import { StaleSyncCycleError } from "@alepes/persistence";
 import type {
   ExternalObservationRef,
   FinancialObservation,
@@ -41,6 +42,12 @@ class FakeStore implements ProviderSyncStore {
     return this.checkpoint ? { accountBindingId: "b" as AccountBindingId, cursor: this.checkpoint.cursor, status: "reconciled" as const, lastSuccessAt: null, inProgressCycleId: null } : null;
   }
   async reconcileSyncCycle(input: ReconcileSyncCycleInput): Promise<ReconcileSyncCycleResult> {
+    // Mirror the real store's stale-guard: reject if the current authoritative
+    // cursor does not match the cycle's starting cursor.
+    const current = this.checkpoint?.cursor ?? "";
+    if (current !== input.startingCursor) {
+      throw new StaleSyncCycleError(input.accountBindingId, input.startingCursor, current);
+    }
     this.reconcileCalls.push(input);
     this.checkpoint = { cursor: input.nextCursor }; // atomically advance the cursor
     return { added: input.delta.added.map((o) => o.id), modified: input.delta.modified.map((o) => o.id), removed: [] };
@@ -81,7 +88,6 @@ function obs(ref: string): FinancialObservation {
     amountCents: 100_00 as FinancialObservation["amountCents"],
     direction: "credit",
     status: "posted",
-    balanceAfterCents: 500_00 as FinancialObservation["balanceAfterCents"],
     firstObservedAt: "2026-09-01T00:00:00Z",
     postedAt: "2026-09-01T00:00:00Z",
     description: "deposit",
@@ -89,7 +95,7 @@ function obs(ref: string): FinancialObservation {
   };
 }
 
-const binding: AccountBinding = { id: "provider-binding", providerAccountRef: "acct" as ExternalObservationRef, metadata: {} };
+const binding: AccountBinding = { id: "provider-binding", providerAccountRef: "acct" as ExternalObservationRef, credentialRef: "cred:test", metadata: {} };
 const persistedBindingId = "binding-acct" as AccountBindingId;
 let seq = 0;
 const newCycleId = (): SyncCycleId => ("cycle-" + ++seq) as SyncCycleId;

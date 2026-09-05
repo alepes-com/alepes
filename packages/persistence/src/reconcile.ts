@@ -15,7 +15,10 @@ import type { PersistedObservation } from "./sync-ports";
 
 /**
  * Convert a persisted observation into the FinancialObservation shape the pure
- * interpretation layer expects, carrying the provider-reported balance-after fact.
+ * interpretation layer expects. The account balance is NOT part of the
+ * transaction observation (providers don't report a per-transaction "balance
+ * after"); it is carried separately as `qualificationBalanceCents` and fed to
+ * qualification directly.
  */
 function toFinancialObservation(o: PersistedObservation): FinancialObservation {
   return {
@@ -25,9 +28,6 @@ function toFinancialObservation(o: PersistedObservation): FinancialObservation {
     amountCents: o.amountCents as Cents,
     direction: o.direction,
     status: o.status,
-    ...(o.balanceAfterCents !== null
-      ? { balanceAfterCents: o.balanceAfterCents as NonNegativeCents }
-      : {}),
     firstObservedAt: o.firstObservedAt,
     ...(o.postedAt ? { postedAt: o.postedAt } : {}),
     description: o.description,
@@ -39,7 +39,7 @@ function toFinancialObservation(o: PersistedObservation): FinancialObservation {
  * Deterministically derive qualifying CashEvents from reconciled active
  * observations. Invariants:
  *  - pending observations never qualify (not yet executable);
- *  - only posted incoming-cash observations with a reported balance qualify;
+ *  - only posted incoming-cash observations with a captured account balance qualify;
  *  - a removed observation never appears (it is inactive);
  *  - a predecessor-linked observation does NOT duplicate its predecessor's event.
  */
@@ -65,7 +65,13 @@ export function qualifyCashEvents(observations: PersistedObservation[]): CashEve
     }
     const fin = toFinancialObservation(o);
     const interp = interpretObservation(fin);
-    const event = qualifyCashEvent(fin, interp);
+    // The account balance captured for this observation's sync cycle is the
+    // balance used for qualification — never a fabricated per-transaction value.
+    const balance =
+      o.qualificationBalanceCents === null
+        ? undefined
+        : (o.qualificationBalanceCents as NonNegativeCents);
+    const event = qualifyCashEvent(fin, interp, balance);
     if (event) {
       events.push(event);
       seen.add(o.id);

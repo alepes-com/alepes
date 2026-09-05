@@ -28,9 +28,10 @@ function pObs(o: {
   amountCents?: number;
   direction?: "credit" | "debit";
   status?: "pending" | "posted";
-  balanceAfterCents?: number | null;
+  qualificationBalanceCents?: number | null;
   state?: "active" | "removed";
   predecessorObservationId?: string | null;
+  lastReconciledCycleId?: string | null;
 }): PersistedObservation {
   return {
     id: o.id as FinancialObservationId,
@@ -38,13 +39,14 @@ function pObs(o: {
     amountCents: o.amountCents ?? 100_000,
     direction: o.direction ?? "credit",
     status: o.status ?? "posted",
-    balanceAfterCents: o.balanceAfterCents === undefined ? 500_000 : o.balanceAfterCents,
+    qualificationBalanceCents: o.qualificationBalanceCents === undefined ? 500_000 : o.qualificationBalanceCents,
     firstObservedAt: "2026-09-01T00:00:00Z",
     postedAt: o.status === "pending" ? null : "2026-09-01T00:00:00Z",
     description: "deposit",
     normalizationVersion: "norm@1",
     state: o.state ?? "active",
     predecessorObservationId: (o.predecessorObservationId ?? null) as FinancialObservationId | null,
+    lastReconciledCycleId: (o.lastReconciledCycleId ?? null) as SyncCycleId | null,
     createdAt: "2026-09-01T00:00:00Z",
     updatedAt: "2026-09-01T00:00:00Z",
   };
@@ -79,11 +81,10 @@ const portfolio: PortfolioState = {
   totalValue: nonNegativeCents(100_000),
 };
 
-function shadow(o: PersistedObservation[], cycleId?: SyncCycleId) {
+function shadow(o: PersistedObservation[]) {
   return runShadowMode(o, {
     rules: [anyDepositRule],
     portfolioState: portfolio,
-    cycleId,
   });
 }
 
@@ -185,15 +186,35 @@ describe("Shadow Mode composition", () => {
     }
   });
 
-  it("12. provenance traces from Shadow decision back to observation + binding + cycle", () => {
-    const cycleId = "cycle-9" as SyncCycleId;
-    const decisions = shadow([pObs({ id: "o1", accountBindingId: BID_A })], cycleId);
+  it("12. provenance traces from Shadow decision back to observation + binding + per-observation cycle", () => {
+    const decisions = shadow([
+      pObs({ id: "o1", accountBindingId: BID_A, lastReconciledCycleId: "cycle-9" }),
+    ]);
     expect(decisions[0].provenance.cashEventId).toBe("o1");
     expect(decisions[0].provenance.observationId).toBe("o1");
     expect(decisions[0].provenance.accountBindingId).toBe(BID_A);
-    expect(decisions[0].provenance.cycleId).toBe(cycleId);
+    // The cycle comes from the observation's OWN persisted lastReconciledCycleId.
+    expect(decisions[0].provenance.cycleId).toBe("cycle-9");
     // The CashEvent id IS the FinancialObservationId (same identity chain).
     expect(decisions[0].plan.cashEvent.id).toBe(decisions[0].provenance.observationId);
+  });
+
+  it("12b. two observations from DIFFERENT sync cycles retain their own cycle provenance", () => {
+    const decisions = shadow([
+      pObs({ id: "o1", accountBindingId: BID_A, lastReconciledCycleId: "cycle-1" }),
+      pObs({ id: "o2", accountBindingId: BID_A, lastReconciledCycleId: "cycle-2" }),
+    ]);
+    expect(decisions).toHaveLength(2);
+    const byId = new Map(decisions.map((d) => [d.plan.cashEvent.id, d.provenance.cycleId]));
+    expect(byId.get("o1")).toBe("cycle-1");
+    expect(byId.get("o2")).toBe("cycle-2");
+  });
+
+  it("12c. missing binding throws an invariant error instead of fabricating an empty id", () => {
+    // A persisted observation with an unresolvable (empty) binding id is a data
+    // defect; runShadowMode must NOT silently mint "" as a branded id.
+    const obs = pObs({ id: "o1", accountBindingId: "" as AccountBindingId });
+    expect(() => shadow([obs])).toThrow();
   });
 
   it("13. delivery to existing engines: rules→capital→allocation→shadow (full pipeline)", () => {
@@ -218,7 +239,7 @@ describe("Shadow Mode properties (fast-check)", () => {
     fc.assert(
       fc.property(fc.array(fc.integer({ min: 1, max: 1_000_000 }), { minLength: 1, maxLength: 20 }), (amounts) => {
         const obs = amounts.map((a, i) =>
-          pObs({ id: `o${i}`, amountCents: a, balanceAfterCents: a })
+          pObs({ id: `o${i}`, amountCents: a, qualificationBalanceCents: a })
         );
         const r1 = shadow(obs);
         const r2 = shadow(obs);
@@ -232,7 +253,7 @@ describe("Shadow Mode properties (fast-check)", () => {
   it("a qualifying observation never produces more than one CashEvent regardless of repetition", () => {
     fc.assert(
       fc.property(fc.integer({ min: 1000, max: 100_000 }), (amt) => {
-        const d = shadow([pObs({ id: "o1", amountCents: amt, balanceAfterCents: amt })]);
+        const d = shadow([pObs({ id: "o1", amountCents: amt, qualificationBalanceCents: amt })]);
         // Exactly one decision, and its id is stable.
         expect(d).toHaveLength(1);
         expect(d[0].plan.cashEvent.id).toBe("o1");
@@ -246,7 +267,7 @@ describe("Shadow Mode properties (fast-check)", () => {
       fc.property(fc.boolean(), (isDebit) => {
         const obs = isDebit
           ? [pObs({ id: "o1", direction: "debit", amountCents: -100 })]
-          : [pObs({ id: "o1", balanceAfterCents: null })];
+          : [pObs({ id: "o1", qualificationBalanceCents: null })];
         const d = runShadowMode(obs, { rules: [anyDepositRule], portfolioState: portfolio });
         expect(d).toHaveLength(0);
       }),

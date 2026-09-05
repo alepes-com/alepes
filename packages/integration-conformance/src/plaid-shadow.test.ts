@@ -1,16 +1,25 @@
 // End-to-end (fixture-backed): a Plaid-shaped incoming transaction flows the
 // FULL read-only path into Shadow Mode without ever invoking money movement.
 //
-//   Plaid fixture → adapter.syncObservations (sign flip at boundary)
-//     → normalized FinancialObservation → persisted observation shape
+//   Plaid fixture (transactions + account balances)
+//     → adapter.syncObservations (sign flip + account-balance snapshot at the boundary)
+//     → normalized FinancialObservation + AccountBalanceSnapshot
+//     → persisted observation + qualification balance (reconciled)
 //     → qualifyCashEvents → runShadowMode (shadow disposition only)
 //
-// No live Plaid SDK call, no credentials, no brokerage/transfer capability.
+// The balance comes from the Plaid fixture/account-data boundary — it is NOT
+// hand-injected after normalization. No live Plaid SDK call, no credentials.
 
 import { describe, it, expect } from "vitest";
-import { createPlaidFinancialDataProvider, type PlaidTransactionsSyncClient } from "@alepes/plaid-financial-data";
-import { incomingPlaidTransaction, syncResponse } from "@alepes/plaid-financial-data";
+import {
+  createPlaidFinancialDataProvider,
+  incomingPlaidTransaction,
+  plaidAccountWithBalances,
+  syncResponse,
+  type PlaidTransactionsSyncClient,
+} from "@alepes/plaid-financial-data";
 import { runShadowMode } from "@alepes/reconciliation";
+import { selectAccountBalance } from "@alepes/domain";
 import type { AccountBinding } from "@alepes/integration-runtime";
 import type { ExternalObservationRef, FinancialObservationId } from "@alepes/domain";
 import type { AccountBindingId, PersistedObservation, SyncCycleId } from "@alepes/persistence";
@@ -46,54 +55,64 @@ const portfolio: PortfolioState = {
   totalValue: nonNegativeCents(100_000),
 };
 
-describe("fixture-backed Plaid → Shadow Mode (read-only)", () => {
-  it("a qualified incoming Plaid transaction reaches Shadow Mode with no money movement", async () => {
-    // 1. Adapter, driven by a deterministic Plaid-shaped fixture (no SDK call).
-    const client: PlaidTransactionsSyncClient = {
-      transactionsSync: async () => ({
-        data: syncResponse({
-          added: [incomingPlaidTransaction("txn-in", -800.0)], // -$800 Plaid = +$800 Alepes (money IN)
-          next_cursor: "c1",
-          has_more: false,
-        }),
-      }),
-    };
-    const provider = createPlaidFinancialDataProvider({
-      client,
-      resolveAccessToken: async () => "unused",
-      discover: async () => [{ accountId: "acct-1", name: "Checking" }],
-    });
-    const accts = await provider.discoverAccounts("cred:x");
-    const binding: AccountBinding = accts[0];
+function makeProvider(transactionsSync: PlaidTransactionsSyncClient["transactionsSync"]) {
+  return createPlaidFinancialDataProvider({
+    client: { transactionsSync },
+    resolveAccessToken: async (ref) => (ref === "cred:a" ? "tok-a" : "tok-b"),
+    discover: async () => [
+      { accountId: "acct-1", name: "Checking" },
+      { accountId: "acct-2", name: "Savings" },
+    ],
+  });
+}
 
-    // 2. Normalize via the adapter (the sign flip happens here).
+describe("fixture-backed Plaid → Shadow Mode (read-only)", () => {
+  it("an incoming Plaid transaction qualifies via the adapter's account-balance snapshot (no synthetic balance)", async () => {
+    const provider = makeProvider(async () => ({
+      data: syncResponse({
+        added: [incomingPlaidTransaction("txn-in", -800.0)], // -$800 Plaid = +$800 Alepes (money IN)
+        accounts: [plaidAccountWithBalances({ available: 5000, current: 4900 }) as never],
+        next_cursor: "c1",
+        has_more: false,
+      }),
+    }));
+    const binding: AccountBinding = (await provider.discoverAccounts("cred:a"))[0];
+
+    // The adapter produces BOTH the transaction delta AND an account balance
+    // snapshot — the balance is not injected by the test.
     const delta = await provider.syncObservations(binding, "");
     expect(delta.added).toHaveLength(1);
-    const obs = delta.added[0];
-    expect(obs.direction).toBe("credit");
-    expect(obs.amountCents).toBe(80_000); // +$800.00 in Alepes credits
+    expect(delta.added[0].direction).toBe("credit");
+    expect(delta.added[0].amountCents).toBe(80_000);
+    expect(delta.accountBalance).toBeDefined();
+    expect(delta.accountBalance!.accountBindingId).toBe(binding.id);
 
-    // 3. Persisted-observation shape (what reconcileSyncCycle stored).
+    // The selected balance (available ?? current) is what qualification uses.
+    const selected = selectAccountBalance(delta.accountBalance!);
+    expect(selected).toBe(500_000); // available $5000.00
+
+    // Build the persisted observation shape the SAME way reconcileSyncCycle does:
+    // the durable id is minted by persistence, and the qualification balance is
+    // the SELECTED account balance carried on the sync cycle (not per-transaction).
     const persisted: PersistedObservation = {
-      id: obs.id,
+      id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FAV" as FinancialObservationId,
       accountBindingId: "binding-acct-1" as AccountBindingId,
-      amountCents: obs.amountCents,
-      direction: obs.direction,
-      status: obs.status,
-      balanceAfterCents: 5_000_00,
-      firstObservedAt: obs.firstObservedAt,
-      postedAt: obs.postedAt ?? null,
-      description: obs.description,
-      normalizationVersion: obs.normalizationVersion,
+      amountCents: delta.added[0].amountCents,
+      direction: delta.added[0].direction,
+      status: delta.added[0].status,
+      qualificationBalanceCents: selected,
+      firstObservedAt: delta.added[0].firstObservedAt,
+      postedAt: delta.added[0].postedAt ?? null,
+      description: delta.added[0].description,
+      normalizationVersion: delta.added[0].normalizationVersion,
       state: "active",
       predecessorObservationId: null,
-      createdAt: obs.firstObservedAt,
-      updatedAt: obs.firstObservedAt,
+      lastReconciledCycleId: "cycle-1" as SyncCycleId,
+      createdAt: delta.added[0].firstObservedAt,
+      updatedAt: delta.added[0].firstObservedAt,
     };
 
-    // 4. Run Shadow Mode.
-    const cycleId = "cycle-1" as SyncCycleId;
-    const decisions = runShadowMode([persisted], { rules: [rule], portfolioState: portfolio, cycleId });
+    const decisions = runShadowMode([persisted], { rules: [rule], portfolioState: portfolio });
 
     expect(decisions).toHaveLength(1);
     const d = decisions[0];
@@ -102,78 +121,82 @@ describe("fixture-backed Plaid → Shadow Mode (read-only)", () => {
     expect(d.disposition.kind).toBe("shadow");
     expect(d.plan.proposedDisposition.kind).toBe("shadow");
 
-    // It DID plan a deployment (50% of $800 = $400 toward the underweight holding).
+    // It planned a deployment (50% of $800 = $400 toward the underweight holding).
     expect(d.plan.capitalPlan.deployable).toBe(40_000);
     expect(d.plan.allocationPlan.totalDeployed).toBe(40_000);
 
+    // The CashEvent's balance is the ACCOUNT snapshot, not a fabricated
+    // per-transaction "balance after".
+    expect(d.plan.cashEvent.checkingBalanceAfter).toBe(500_000);
+
     // Provenance is intact: decision → CashEvent → FinancialObservationId → binding.
-    expect(d.provenance.cashEventId).toBe(obs.id);
-    expect(d.provenance.observationId).toBe(obs.id);
+    expect(d.provenance.cashEventId).toBe("obs_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    expect(d.provenance.observationId).toBe("obs_01ARZ3NDEKTSV4RRFFQ69G5FAV");
     expect(d.provenance.accountBindingId).toBe("binding-acct-1");
-    expect(d.provenance.cycleId).toBe(cycleId);
+    expect(d.provenance.cycleId).toBe("cycle-1");
 
-    // The CashEvent id is the Alepes observation id, NOT the Plaid transaction id.
-    expect(d.plan.cashEvent.id).toBe(obs.id);
-    expect(d.plan.cashEvent.id).not.toBe("txn-in");
-
-    // No order was handed to any brokerage/transfer capability (orders are only
-    // INSIDE the plan; the shadow disposition releases zero orders).
+    // No order reaches any brokerage/transfer capability (shadow-only).
     expect(d.plan.orders.length).toBeGreaterThan(0);
     expect(d.disposition.kind).not.toBe("execute");
   });
 
   it("does not leak the provider external reference into financial-policy inputs", async () => {
-    // The external Plaid id must appear only in provenance (via observation id
-    // mapping), never inside the CashEvent or plans themselves. In the real
-    // pipeline the persistence layer mints a ULID id and drops the adapter's
-    // provisional `obs-${ref}` id, so the durable identity never encodes the ref.
-    const client: PlaidTransactionsSyncClient = {
-      transactionsSync: async () => ({
-        data: syncResponse({
-          added: [incomingPlaidTransaction("plaid-secret-tx-id", -100.0)],
-          next_cursor: "c1",
-          has_more: false,
-        }),
+    const provider = makeProvider(async () => ({
+      data: syncResponse({
+        added: [incomingPlaidTransaction("plaid-secret-tx-id", -100.0)],
+        accounts: [plaidAccountWithBalances({ current: 500 }) as never],
+        next_cursor: "c1",
+        has_more: false,
       }),
-    };
-    const provider = createPlaidFinancialDataProvider({
-      client,
-      resolveAccessToken: async () => "x",
-      discover: async () => [{ accountId: "acct-1", name: "Checking" }],
-    });
-    const binding: AccountBinding = (await provider.discoverAccounts("cred:x"))[0];
+    }));
+    const binding: AccountBinding = (await provider.discoverAccounts("cred:a"))[0];
     const delta = await provider.syncObservations(binding, "");
     const obs = delta.added[0];
     expect(obs.externalRef).toBe("plaid-secret-tx-id" as ExternalObservationRef);
+    const selected = selectAccountBalance(delta.accountBalance!);
 
-    // The durable, Alepes-minted id (what reconcileSyncCycle persists) is a ULID,
-    // NOT the adapter's provisional `obs-plaid-secret-tx-id`.
     const durableId = "obs_01ARZ3NDEKTSV4RRFFQ69G5FAV" as FinancialObservationId;
-
     const persisted: PersistedObservation = {
       id: durableId,
       accountBindingId: "b" as AccountBindingId,
       amountCents: obs.amountCents,
       direction: obs.direction,
       status: obs.status,
-      balanceAfterCents: 200_00,
+      qualificationBalanceCents: selected,
       firstObservedAt: obs.firstObservedAt,
       postedAt: obs.postedAt ?? null,
       description: obs.description,
       normalizationVersion: obs.normalizationVersion,
       state: "active",
       predecessorObservationId: null,
+      lastReconciledCycleId: null,
       createdAt: obs.firstObservedAt,
       updatedAt: obs.firstObservedAt,
     };
 
     const decisions = runShadowMode([persisted], { rules: [rule], portfolioState: portfolio });
     expect(decisions).toHaveLength(1);
-    // The CashEvent id is the durable Alepes id, not the provider ref, not the
-    // adapter's provisional id.
     expect(decisions[0].plan.cashEvent.id).toBe(durableId);
     // The raw Plaid id never appears anywhere in the plan.
     const serialized = JSON.stringify(decisions.map((d) => d.plan));
     expect(serialized).not.toContain("plaid-secret-tx-id");
+  });
+
+  it("cached balances qualify for Shadow, and the snapshot is marked cached", async () => {
+    const provider = makeProvider(async () => ({
+      data: syncResponse({
+        added: [incomingPlaidTransaction("txn-cached", -50.0)],
+        accounts: [plaidAccountWithBalances({ available: null, current: 1234.56 }) as never],
+        next_cursor: "c1",
+        has_more: false,
+      }),
+    }));
+    const binding: AccountBinding = (await provider.discoverAccounts("cred:a"))[0];
+    const delta = await provider.syncObservations(binding, "");
+    // available is null → falls back to current ($1234.56 → 123456 cents).
+    const selected = selectAccountBalance(delta.accountBalance!);
+    expect(selected).toBe(123_456);
+    // The snapshot is explicitly flagged as provider-cached (Shadow-appropriate).
+    expect(delta.accountBalance!.isCachedByProvider).toBe(true);
   });
 });

@@ -5,6 +5,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { runMigrations } from "./migrations";
 import { createSyncPostgresStore } from "./sync-postgres";
 import type { ProviderSyncStore, AccountBindingId, SyncCycleId } from "./sync-ports";
+import { StaleSyncCycleError } from "./sync-ports";
 import { cents, nonNegativeCents } from "@alepes/money";
 import type {
   ExternalObservationRef,
@@ -42,10 +43,9 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
   });
 
   function obs(
-    overrides: Omit<Partial<FinancialObservation>, "externalRef" | "amountCents" | "balanceAfterCents"> & {
+    overrides: Omit<Partial<FinancialObservation>, "externalRef" | "amountCents"> & {
       externalRef: string;
       amountCents?: number;
-      balanceAfterCents?: number;
     }
   ): FinancialObservation {
     return {
@@ -59,9 +59,6 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
       postedAt: overrides.status === "pending" ? undefined : "2026-09-01T00:00:00Z",
       description: overrides.description ?? "record",
       normalizationVersion: "norm@1",
-      ...(overrides.balanceAfterCents !== undefined
-        ? { balanceAfterCents: nonNegativeCents(overrides.balanceAfterCents) }
-        : {}),
       ...(overrides.predecessorRef
         ? { predecessorRef: overrides.predecessorRef as ExternalObservationRef }
         : {}),
@@ -85,9 +82,17 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
   const cycle = (): SyncCycleId => ulid() as SyncCycleId;
   const extRef = (s: string): ExternalObservationRef => s as ExternalObservationRef;
 
+  // Reconcile using the CURRENT persisted cursor as the expected starting cursor,
+  // mirroring how the orchestrator reads the checkpoint before paging the provider.
+  async function rec(input: Omit<Parameters<ProviderSyncStore["reconcileSyncCycle"]>[0], "startingCursor">) {
+    const cp = await store.loadCheckpoint(input.accountBindingId);
+    const startingCursor = cp?.cursor ?? "";
+    return store.reconcileSyncCycle({ ...input, startingCursor });
+  }
+
   it("1. first added record creates one observation + mapping", async () => {
     const b = await bind();
-    const res = await store.reconcileSyncCycle({
+    const res = await rec({
       accountBindingId: b.id,
       cycleId: cycle(),
       normalizationVersion: "norm@1",
@@ -102,11 +107,11 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
 
   it("2. replay of the same addition creates no duplicate", async () => {
     const b = await bind();
-    const first = await store.reconcileSyncCycle({
+    const first = await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: "t1" })] }), nextCursor: "c1",
     });
-    const second = await store.reconcileSyncCycle({
+    const second = await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: "t1" })] }), nextCursor: "c1",
     });
@@ -118,11 +123,11 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
 
   it("3. modified record updates the same Alepes observation ID", async () => {
     const b = await bind();
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: "t1", amountCents: 100_00 })] }), nextCursor: "c1",
     });
-    const res = await store.reconcileSyncCycle({
+    const res = await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ modified: [obs({ externalRef: "t1", amountCents: 150_00 })] }), nextCursor: "c2",
     });
@@ -134,11 +139,11 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
 
   it("4. removed record becomes inactive without deleting history", async () => {
     const b = await bind();
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: "t1" })] }), nextCursor: "c1",
     });
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ removed: ["t1" as ExternalObservationRef] }), nextCursor: "c2",
     });
@@ -151,11 +156,11 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
 
   it("5. pending → posted (same ref) yields at most one active qualifying observation", async () => {
     const b = await bind();
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: "t1", status: "pending" })] }), nextCursor: "c1",
     });
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ modified: [obs({ externalRef: "t1", status: "posted" })] }), nextCursor: "c2",
     });
@@ -166,11 +171,11 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
 
   it("6. pending removed + posted replacement with predecessor linkage → one active", async () => {
     const b = await bind();
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: "A", status: "pending" })] }), nextCursor: "c1",
     });
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({
         removed: ["A" as ExternalObservationRef],
@@ -194,7 +199,7 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
     // violates NOT NULL (cast through the typed boundary deliberately for the test).
     const failingDelta = delta({ added: [obs({ externalRef: null as unknown as string })] });
     await expect(
-      store.reconcileSyncCycle({
+      rec({
         accountBindingId: b.id,
         cycleId: cycle(),
         normalizationVersion: "norm@1",
@@ -212,7 +217,7 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
 
   it("8. cursor advances only after complete successful reconciliation", async () => {
     const b = await bind();
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: "t1" })] }), nextCursor: "c1",
     });
@@ -223,7 +228,7 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
 
   it("10. restart-sync leaves persisted cursor unchanged (no partial advance)", async () => {
     const b = await bind();
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: "t1" })] }), nextCursor: "c1",
     });
@@ -247,12 +252,12 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
 
   it("12. external-ref uniqueness is scoped per binding + provider", async () => {
     const b = await bind();
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: "t1" })] }), nextCursor: "c1",
     });
     // A second add with the same external ref maps to the same observation id.
-    const again = await store.reconcileSyncCycle({
+    const again = await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: "t1" })] }), nextCursor: "c1",
     });
@@ -261,7 +266,7 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
 
   it("13. raw credentials cannot appear in persisted rows", async () => {
     const b = await bind();
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: "t1", description: "secret-token-123" })] }), nextCursor: "c1",
     });
@@ -278,20 +283,30 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
   it("14. repeated complete sync cycle is idempotent", async () => {
     const b = await bind();
     const d = delta({ added: [obs({ externalRef: "t1" })] });
-    await store.reconcileSyncCycle({ accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1", delta: d, nextCursor: "c1" });
+    await rec({ accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1", delta: d, nextCursor: "c1" });
     const active1 = (await store.listActiveObservations(b.id)).length;
-    await store.reconcileSyncCycle({ accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1", delta: d, nextCursor: "c1" });
+    await rec({ accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1", delta: d, nextCursor: "c1" });
     const active2 = (await store.listActiveObservations(b.id)).length;
     expect(active2).toBe(active1);
   });
 
-  it("15. concurrent/retried reconciliation cannot allocate two IDs for one binding + ref", async () => {
+  it("15. concurrent reconciliation from the same starting cursor: one commits, the other is stale", async () => {
     const b = await bind();
     const d = delta({ added: [obs({ externalRef: "t1" })] });
-    await Promise.all([
-      store.reconcileSyncCycle({ accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1", delta: d, nextCursor: "c1" }),
-      store.reconcileSyncCycle({ accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1", delta: d, nextCursor: "c1" }),
+    // Both cycles genuinely began from the SAME empty cursor (""). Because the
+    // advisory lock serializes reconciliation and the stale-guard rejects a cycle
+    // whose starting cursor no longer matches the authoritative cursor, exactly
+    // one commits and the other is rejected as stale.
+    const [first, second] = await Promise.allSettled([
+      store.reconcileSyncCycle({ accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1", delta: d, startingCursor: "", nextCursor: "c1" }),
+      store.reconcileSyncCycle({ accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1", delta: d, startingCursor: "", nextCursor: "c1" }),
     ]);
+    const fulfilled = [first, second].filter((r) => r.status === "fulfilled");
+    const rejected = [first, second].filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason).toBeInstanceOf(StaleSyncCycleError);
+
     const { Pool } = await import("pg");
     const pool = new Pool({ connectionString: TEST_CONNECTION });
     const rows = await pool.query(
@@ -302,23 +317,65 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
     await pool.end();
   });
 
-  it("16. balance-after is persisted and read back for downstream qualification", async () => {
+  it("18. stale cycle cannot regress the authoritative cursor (C20 → C10 rejected)", async () => {
     const b = await bind();
-    await store.reconcileSyncCycle({
+    // Cycle A commits from "" → C10.
+    await rec({ accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1", delta: delta({ added: [obs({ externalRef: "a" })] }), nextCursor: "C10" });
+
+    // Cycle B (concurrent slower cycle) had ALSO read starting cursor "" before A
+    // committed. It now tries to commit with startingCursor "" → C20. Because the
+    // authoritative cursor is C10, this is stale and must be rejected.
+    await expect(
+      store.reconcileSyncCycle({
+        accountBindingId: b.id,
+        cycleId: cycle(),
+        normalizationVersion: "norm@1",
+        delta: delta({ added: [obs({ externalRef: "b" })] }),
+        startingCursor: "",
+        nextCursor: "C20",
+      })
+    ).rejects.toBeInstanceOf(StaleSyncCycleError);
+
+    // The authoritative cursor stays C10 (never regressed to C20, never back to "").
+    const cp = await store.loadCheckpoint(b.id);
+    expect(cp?.cursor).toBe("C10");
+    // The stale cycle's observation was NOT applied.
+    const active = await store.listActiveObservations(b.id);
+    expect(active).toHaveLength(1);
+    expect(active[0].description).toBe("record");
+  });
+
+  it("16. account balance snapshot is persisted and read back for qualification", async () => {
+    const b = await bind();
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
-      // balanceAfterCents is a provider fact that qualification requires downstream.
-      delta: delta({ added: [obs({ externalRef: "t1", balanceAfterCents: 5000_00 })] }),
+      // The balance is an ACCOUNT-level snapshot carried on the sync delta, not a
+      // per-transaction "balance after".
+      delta: delta({
+        added: [obs({ externalRef: "t1" })],
+        accountBalance: {
+          accountBindingId: b.id,
+          availableCents: nonNegativeCents(5000_00),
+          currentCents: nonNegativeCents(4900_00),
+          capturedAt: "2026-09-01T00:00:00Z",
+          isCachedByProvider: true,
+          normalizationVersion: "norm@1",
+        },
+      }),
       nextCursor: "c1",
     });
     const active = await store.listActiveObservations(b.id);
     expect(active).toHaveLength(1);
-    expect(active[0].balanceAfterCents).toBe(500000);
+    // selectAccountBalance: available (500000) wins over current (490000).
+    expect(active[0].qualificationBalanceCents).toBe(500000);
+    // The cycle that reconciled this observation is recorded (provenance).
+    expect(active[0].lastReconciledCycleId).toBeTruthy();
   });
 
   it("17. persisted observation id is Alepes-minted and does NOT encode the external ref", async () => {
     const b = await bind();
     const providerId = "plaid-tx-secret-123"; // the raw provider identifier
-    await store.reconcileSyncCycle({
+    await rec({
       accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
       delta: delta({ added: [obs({ externalRef: providerId })] }),
       nextCursor: "c1",
@@ -332,5 +389,41 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
     expect(persistedId).not.toContain(providerId);
     // And it is provably distinct from the adapter's provisional `obs-${ref}` id.
     expect(persistedId).not.toBe(`obs-${providerId}`);
+  });
+
+  it("19. rebinding the same account with a new credential ref retains the binding id and updates the ref", async () => {
+    const b1 = await store.bindAccount({
+      providerId: "plaid",
+      providerAccountRef: "acct-1" as ExternalObservationRef,
+      credentialRef: "cred:old",
+      metadata: { subtype: "checking" },
+    });
+
+    // Re-bind the SAME provider/account with a NEW credential reference.
+    const b2 = await store.bindAccount({
+      providerId: "plaid",
+      providerAccountRef: "acct-1" as ExternalObservationRef,
+      credentialRef: "cred:rotated",
+      metadata: { subtype: "checking", reconnected: "true" },
+    });
+
+    // Same durable Alepes binding id (never a second binding).
+    expect(b2.id).toBe(b1.id);
+    // The credential ref is updated in place.
+    expect(b2.credentialRef).toBe("cred:rotated");
+    // Metadata reflects the rebind, and the binding is active.
+    expect(b2.active).toBe(true);
+    expect((b2.metadata as Record<string, string>).reconnected).toBe("true");
+
+    // No raw secret is ever persisted — only the opaque reference.
+    const { Pool } = await import("pg");
+    const pool = new Pool({ connectionString: TEST_CONNECTION });
+    const rows = await pool.query(
+      `SELECT credential_ref FROM account_bindings WHERE id=$1`,
+      [b1.id]
+    );
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0].credential_ref).toBe("cred:rotated");
+    await pool.end();
   });
 });

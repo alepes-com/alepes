@@ -6,10 +6,11 @@ import {
   type FinancialObservationId,
   type ExternalObservationRef,
 } from "./index";
-import { cents, nonNegativeCents } from "@alepes/money";
+import { cents, nonNegativeCents, type NonNegativeCents } from "@alepes/money";
 
 const OID = "obs" as FinancialObservationId;
 const EREF = "ext" as ExternalObservationRef;
+const BAL = nonNegativeCents(5000_00);
 
 function obs(overrides: Partial<FinancialObservation>): FinancialObservation {
   return {
@@ -23,28 +24,27 @@ function obs(overrides: Partial<FinancialObservation>): FinancialObservation {
     postedAt: "2026-09-01T00:00:00Z",
     description: "paycheck",
     normalizationVersion: "norm@1",
-    balanceAfterCents: nonNegativeCents(5000_00),
     ...overrides,
   };
 }
 
 describe("observation interpretation (pure)", () => {
-  it("posted incoming cash may qualify", () => {
+  it("posted incoming cash may qualify (given an account balance)", () => {
     const interp = interpretObservation(obs({ direction: "credit", status: "posted" }));
     expect(interp.kind).toBe("incoming_cash");
-    expect(qualifyCashEvent(obs({ direction: "credit", status: "posted" }), interp)).not.toBeNull();
+    expect(qualifyCashEvent(obs({ direction: "credit", status: "posted" }), interp, BAL)).not.toBeNull();
   });
 
   it("pending incoming cash cannot become executable cash", () => {
     const interp = interpretObservation(obs({ direction: "credit", status: "pending" }));
     expect(interp.kind).toBe("unknown");
-    expect(qualifyCashEvent(obs({ direction: "credit", status: "pending" }), interp)).toBeNull();
+    expect(qualifyCashEvent(obs({ direction: "credit", status: "pending" }), interp, BAL)).toBeNull();
   });
 
   it("outgoing transactions do not qualify", () => {
     const interp = interpretObservation(obs({ direction: "debit", status: "posted", amountCents: cents(-50_00) }));
     expect(interp.kind).toBe("outgoing_cash");
-    expect(qualifyCashEvent(obs({ direction: "debit", status: "posted" }), interp)).toBeNull();
+    expect(qualifyCashEvent(obs({ direction: "debit", status: "posted" }), interp, BAL)).toBeNull();
   });
 
   it("unknown activity stays unknown rather than being guessed into income", () => {
@@ -63,14 +63,20 @@ describe("observation interpretation (pure)", () => {
     // The pending observation never qualifies; only the posted one does.
     const pending = obs({ direction: "credit", status: "pending" });
     const posted = obs({ direction: "credit", status: "posted" });
-    expect(qualifyCashEvent(pending, interpretObservation(pending))).toBeNull();
-    expect(qualifyCashEvent(posted, interpretObservation(posted))).not.toBeNull();
+    expect(qualifyCashEvent(pending, interpretObservation(pending), BAL)).toBeNull();
+    expect(qualifyCashEvent(posted, interpretObservation(posted), BAL)).not.toBeNull();
   });
 
-  it("qualification defers when no balance-after is reported", () => {
-    const interp = interpretObservation(obs({ direction: "credit", status: "posted", balanceAfterCents: undefined }));
+  it("qualification defers when no account balance snapshot is available", () => {
+    const interp = interpretObservation(obs({ direction: "credit", status: "posted" }));
     expect(interp.kind).toBe("incoming_cash");
-    // But without a checking balance it is not yet executable cash.
-    expect(qualifyCashEvent(obs({ direction: "credit", status: "posted", balanceAfterCents: undefined }), interp)).toBeNull();
+    // But without an account balance it is not yet executable cash.
+    expect(qualifyCashEvent(obs({ direction: "credit", status: "posted" }), interp, undefined)).toBeNull();
+  });
+
+  it("the account balance used is the snapshot's selected balance, not a transaction fact", () => {
+    const interp = interpretObservation(obs({ direction: "credit", status: "posted" }));
+    const ev = qualifyCashEvent(obs({ direction: "credit", status: "posted" }), interp, BAL);
+    expect(ev?.checkingBalanceAfter).toBe(BAL);
   });
 });

@@ -36,6 +36,7 @@ describe("certifyFinancialDataProvider", () => {
         bindAccount: async (_c, ref) => ({
           id: "b",
           providerAccountRef: ref,
+          credentialRef: "cred:test",
           metadata: {},
         }),
         syncObservations: async () => ({

@@ -54,21 +54,23 @@ export function createMockFinancialDataProvider(
   const provider: FinancialDataProvider = {
     info: { id: "mock-financial-data", version: "1.0.0" },
 
-    async discoverAccounts(): Promise<AccountBinding[]> {
+    async discoverAccounts(credentialRef: string): Promise<AccountBinding[]> {
       return accountRefs.map((ref, i) => ({
         id: `binding-${i + 1}`,
         providerAccountRef: ref as ExternalObservationRef,
+        credentialRef,
         name: `Account ${ref}`,
         metadata: { subtype: "checking" },
       }));
     },
 
-    async bindAccount(_c, providerAccountRef: ExternalObservationRef): Promise<AccountBinding> {
+    async bindAccount(credentialRef: string, providerAccountRef: ExternalObservationRef): Promise<AccountBinding> {
       const idx = accountRefs.indexOf(providerAccountRef);
       if (idx < 0) throw new ProviderError("not_found", `unknown account ${providerAccountRef}`);
       return {
         id: `binding-${idx + 1}`,
         providerAccountRef,
+        credentialRef,
         name: `Account ${providerAccountRef}`,
         metadata: { subtype: "checking" },
       };

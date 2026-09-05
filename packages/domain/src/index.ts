@@ -69,8 +69,6 @@ export interface FinancialObservation {
   amountCents: Cents;
   direction: ObservationDirection;
   status: ObservationStatus;
-  /** Optional provider-reported balance/amount AFTER this record (integer cents). */
-  balanceAfterCents?: NonNegativeCents;
   /** ISO-8601 timestamp the provider first reported this record. */
   firstObservedAt: string;
   /** ISO-8601 timestamp the record became authoritative/posted (if posted). */
@@ -88,6 +86,37 @@ export interface FinancialObservation {
 }
 
 /**
+ * A provider-neutral account balance snapshot, captured separately from any
+ * transaction observation. Providers (e.g. Plaid) report account balance data
+ * alongside transactions; it is NOT a historical "balance immediately after this
+ * transaction". The snapshot carries its own capture-time and whether the value
+ * is provider-cached vs real-time, so downstream consumers know the freshness.
+ */
+export interface AccountBalanceSnapshot {
+  /** The Alepes account binding this balance belongs to. */
+  accountBindingId: string;
+  /** The available balance, when the provider reports one (integer cents). */
+  availableCents?: NonNegativeCents;
+  /** The current/ledger balance (integer cents). Always present. */
+  currentCents: NonNegativeCents;
+  /** ISO-8601 timestamp the provider captured this balance. */
+  capturedAt: string;
+  /** True when the provider supplied a cached (not real-time) balance. */
+  isCachedByProvider: boolean;
+  /** The normalization version that produced this snapshot. */
+  normalizationVersion: string;
+}
+
+/**
+ * Select the balance to use for qualification from a snapshot: the available
+ * balance when present, otherwise the current balance. Pure and deterministic.
+ * This is the ONLY place the "available ?? current" rule lives.
+ */
+export function selectAccountBalance(snapshot: AccountBalanceSnapshot): NonNegativeCents {
+  return snapshot.availableCents ?? snapshot.currentCents;
+}
+
+/**
  * A provider-neutral synchronization delta. Rather than a flat list that
  * downstream code must diff against a previous snapshot, the provider explicitly
  * partitions one sync cycle's changes into added / modified / removed. This is
@@ -99,6 +128,12 @@ export interface ObservationSyncDelta {
   modified: FinancialObservation[];
   /** Provider references of records that no longer exist (explicit removals). */
   removed: ExternalObservationRef[];
+  /**
+   * The account balance snapshot reported alongside this sync cycle (account
+   * level, NOT a per-transaction "balance after"). When present, it is the
+   * balance used to qualify incoming-cash observations in this cycle.
+   */
+  accountBalance?: AccountBalanceSnapshot;
   /** Opaque cursor/checkpoint to resume from on the NEXT cycle. */
   nextCursor: string;
   /** True when the provider reports further changes after this cycle. */
@@ -150,20 +185,27 @@ export function interpretObservation(obs: FinancialObservation): ObservationInte
  * become executable cash, so a pending→posted replacement yields at most one
  * active CashEvent (the pending one never qualified in the first place).
  *
+ * A `CashEvent` requires a checking balance to be well-formed. For provider-
+ * derived events the balance is the ACCOUNT balance snapshot captured at
+ * qualification/detection time (see `selectAccountBalance`), NOT a per-
+ * transaction "balance immediately after this transaction" — providers do not
+ * report that fact. `accountBalanceCents` is the already-resolved balance.
+ *
  * `source` is a coarse, deterministic categorization and does NOT auto-select a
  * specific financial rule; downstream rule evaluation keeps that decision.
  */
 export function qualifyCashEvent(
   obs: FinancialObservation,
-  interp: ObservationInterpretation
+  interp: ObservationInterpretation,
+  accountBalanceCents: NonNegativeCents | undefined
 ): CashEvent | null {
   if (interp.kind !== "incoming_cash" || obs.status !== "posted") {
     return null;
   }
-  // A well-formed CashEvent requires a checking balance after the event. If the
-  // provider did not report one, qualification is deferred rather than fabricating
-  // a balance — the observation stays normalized but is not yet executable cash.
-  if (obs.balanceAfterCents === undefined) {
+  // A well-formed CashEvent requires an account balance. If no balance snapshot
+  // was captured, qualification is deferred rather than fabricating one — the
+  // observation stays normalized but is not yet executable cash.
+  if (accountBalanceCents === undefined) {
     return null;
   }
   return {
@@ -172,7 +214,7 @@ export function qualifyCashEvent(
     source: "transfer",
     description: obs.description,
     occurredAt: obs.postedAt ?? obs.firstObservedAt,
-    checkingBalanceAfter: obs.balanceAfterCents,
+    checkingBalanceAfter: accountBalanceCents,
   };
 }
 

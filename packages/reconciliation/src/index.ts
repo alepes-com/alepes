@@ -6,6 +6,7 @@ export {
   runShadowMode,
   cashEventIdForObservation,
   totalShadowDeployable,
+  ShadowProvenanceError,
 } from "./shadow";
 export type {
   ShadowDecision,

@@ -27,6 +27,25 @@ export function removedTransaction(transaction_id: string, account_id = "acct-1"
   return { transaction_id, account_id };
 }
 
+/**
+ * A Plaid-shaped account with balances, as returned in the `accounts` array of a
+ * /transactions/sync response. `amounts` are PLAID dollars (floating); the
+ * adapter converts to integer cents and flips nothing (balances are magnitudes).
+ */
+export function plaidAccountWithBalances(overrides: {
+  accountId?: string;
+  available?: number | null;
+  current: number;
+}): { account_id: string; balances: { available: number | null; current: number } } {
+  return {
+    account_id: overrides.accountId ?? "acct-1",
+    balances: {
+      available: overrides.available == null ? null : overrides.available,
+      current: overrides.current,
+    },
+  };
+}
+
 export function syncResponse(overrides: Partial<TransactionsSyncResponse>): TransactionsSyncResponse {
   return {
     transactions_update_status: "HISTORICAL_UPDATE_COMPLETE",

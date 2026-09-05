@@ -123,7 +123,9 @@ export async function syncAccount(
   }
 
   // Full cycle complete: atomically reconcile the merged delta AND advance the
-  // cursor to the final page's cursor. Only now is anything persisted.
+  // cursor to the final page's cursor. Pass the starting cursor so the store can
+  // reject this cycle as stale if a concurrent cycle already advanced it. Only
+  // now is anything persisted.
   await store.reconcileSyncCycle({
     accountBindingId: persistedBindingId,
     delta: {
@@ -133,6 +135,7 @@ export async function syncAccount(
       nextCursor: acc.nextCursor,
       hasMore: false,
     },
+    startingCursor,
     nextCursor: acc.nextCursor,
     cycleId,
     normalizationVersion: opts.normalizationVersion,

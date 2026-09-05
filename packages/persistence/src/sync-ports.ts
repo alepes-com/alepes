@@ -53,8 +53,13 @@ export interface PersistedObservation {
   amountCents: number;
   direction: "credit" | "debit";
   status: "pending" | "posted";
-  /** Provider-reported balance-after fact (nullable; qualification needs it). */
-  balanceAfterCents: number | null;
+  /**
+   * The account balance (selected per selectAccountBalance: available ?? current)
+   * captured in the sync cycle that most recently reconciled this observation.
+   * Null when that cycle reported no account balance. This is an ACCOUNT-level
+   * snapshot, not a per-transaction "balance after".
+   */
+  qualificationBalanceCents: number | null;
   firstObservedAt: string;
   postedAt: string | null;
   description: string;
@@ -62,6 +67,8 @@ export interface PersistedObservation {
   state: ObservationState;
   /** Alepes-internal predecessor link (pending → posted), if provided. */
   predecessorObservationId: FinancialObservationId | null;
+  /** The sync cycle that last reconciled this observation (for provenance). */
+  lastReconciledCycleId: SyncCycleId | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -84,10 +91,34 @@ export interface ReconcileRemovedInput {
 export interface ReconcileSyncCycleInput {
   accountBindingId: AccountBindingId;
   delta: ObservationSyncDelta;
+  /**
+   * The cursor this cycle BEGAN from (the persisted checkpoint read before the
+   * provider was paged). Reconciliation is rejected as stale if the authoritative
+   * cursor no longer equals this when the cycle commits — preventing an older,
+   * slower cycle from regressing a cursor advanced by a newer one.
+   */
+  startingCursor: string;
   /** The cursor to persist only after successful reconciliation. */
   nextCursor: string;
   cycleId: SyncCycleId;
   normalizationVersion: string;
+}
+
+/** Raised when a completed cycle is stale: the persisted cursor moved on. */
+export class StaleSyncCycleError extends Error {
+  readonly kind = "stale_sync_cycle" as const;
+  constructor(
+    public readonly accountBindingId: AccountBindingId,
+    public readonly expectedStartingCursor: string,
+    public readonly actualCursor: string
+  ) {
+    super(
+      `stale sync cycle for binding ${accountBindingId}: expected starting cursor ${JSON.stringify(
+        expectedStartingCursor
+      )}, but authoritative cursor is ${JSON.stringify(actualCursor)}`
+    );
+    this.name = "StaleSyncCycleError";
+  }
 }
 
 /** Result of reconciling one cycle, listing which observation ids were touched. */

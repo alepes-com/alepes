@@ -6,20 +6,21 @@ import type { FinancialObservationId } from "@alepes/domain";
 
 const BID = "b1" as AccountBindingId;
 
-function pObs(o: Omit<Partial<PersistedObservation>, "id"> & { id: string }): PersistedObservation {
+function pObs(o: Omit<Partial<PersistedObservation>, "id" | "qualificationBalanceCents"> & { id: string; qualificationBalanceCents?: number | null }): PersistedObservation {
   return {
     id: o.id as FinancialObservationId,
-    accountBindingId: BID,
+    accountBindingId: o.accountBindingId ?? BID,
     amountCents: o.amountCents ?? 100000,
     direction: o.direction ?? "credit",
     status: o.status ?? "posted",
-    balanceAfterCents: o.balanceAfterCents === undefined ? 500000 : o.balanceAfterCents,
+    qualificationBalanceCents: o.qualificationBalanceCents === undefined ? 500000 : o.qualificationBalanceCents,
     firstObservedAt: o.firstObservedAt ?? "2026-09-01T00:00:00Z",
     postedAt: o.postedAt ?? "2026-09-01T00:00:00Z",
     description: "record",
     normalizationVersion: "norm@1",
     state: o.state ?? "active",
     predecessorObservationId: (o.predecessorObservationId ?? null) as FinancialObservationId | null,
+    lastReconciledCycleId: (o.lastReconciledCycleId ?? null) as SyncCycleId | null,
     createdAt: "2026-09-01T00:00:00Z",
     updatedAt: "2026-09-01T00:00:00Z",
   };
@@ -38,7 +39,7 @@ describe("qualifyCashEvents (pure downstream reconciliation)", () => {
   });
 
   it("a posted observation without a balance does not qualify", () => {
-    const events = qualifyCashEvents([pObs({ id: "o1", balanceAfterCents: null })]);
+    const events = qualifyCashEvents([pObs({ id: "o1", qualificationBalanceCents: null })]);
     expect(events).toHaveLength(0);
   });
 

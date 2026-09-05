@@ -39,9 +39,8 @@ import { qualifyCashEvents } from "@alepes/persistence";
 // A provider-derived Shadow decision must remain explainable back through:
 //   Shadow decision → CashEvent → FinancialObservationId → sync cycle → binding.
 // The `CashEvent.id` IS the durable `FinancialObservationId` (minted by the
-// persistence layer), so it is Alepes-owned and deterministic — a repeated
-// interpretation of the same authoritative observation resolves to the SAME
-// logical CashEvent, never a second deposit event.
+// persistence layer), and the sync cycle comes from the observation's OWN
+// persisted `lastReconciledCycleId` — never a caller-supplied batch cycle.
 //
 
 export interface ShadowProvenance {
@@ -69,8 +68,16 @@ export interface ShadowModeInput {
   rules: CashFlowRule[];
   /** Portfolio state to allocate against (immutable at this version). */
   portfolioState: PortfolioState;
-  /** The sync cycle these observations were reconciled in (for provenance). */
-  cycleId?: SyncCycleId;
+}
+
+/** Raised when a qualifying observation's account binding cannot be resolved. */
+export class ShadowProvenanceError extends Error {
+  constructor(public readonly observationId: CashEvent["id"]) {
+    super(
+      `Shadow provenance invariant violated: no account binding for observation ${observationId}`
+    );
+    this.name = "ShadowProvenanceError";
+  }
 }
 
 /**
@@ -90,7 +97,8 @@ export function cashEventIdForObservation(observationId: CashEvent["id"]): CashE
  * uses; only the execution-policy disposition differs (shadow).
  *
  * Deterministic: no time, random, or ordering dependence beyond the (already
- * deterministic) observation ordering.
+ * deterministic) observation ordering. Each decision's provenance comes from the
+ * observation's own persisted `lastReconciledCycleId` and account binding.
  */
 export function runShadowMode(
   observations: PersistedObservation[],
@@ -99,6 +107,9 @@ export function runShadowMode(
   const events = qualifyCashEvents(observations);
   const bindingByObservationId = new Map<string, AccountBindingId>(
     observations.map((o) => [o.id, o.accountBindingId])
+  );
+  const cycleByObservationId = new Map<string, SyncCycleId | null>(
+    observations.map((o) => [o.id, o.lastReconciledCycleId])
   );
 
   const decisions: ShadowDecision[] = [];
@@ -128,14 +139,21 @@ export function runShadowMode(
     const outcome = decidePolicy(plan, { shadowMode: true });
     const disposition = outcome.disposition;
 
+    // Provenance must come from persisted state; a missing binding is a data-
+    // integrity defect we refuse to paper over.
+    const accountBindingId = bindingByObservationId.get(event.id);
+    if (!accountBindingId) {
+      throw new ShadowProvenanceError(event.id);
+    }
+
     decisions.push({
       plan: { ...plan, proposedDisposition: disposition },
       disposition,
       provenance: {
         cashEventId: cashEventIdForObservation(event.id),
         observationId: event.id,
-        accountBindingId: bindingByObservationId.get(event.id) ?? ("" as AccountBindingId),
-        cycleId: input.cycleId ?? null,
+        accountBindingId,
+        cycleId: cycleByObservationId.get(event.id) ?? null,
       },
     });
   }

@@ -65,6 +65,13 @@ export interface AccountBinding {
   id: string;
   /** Opaque provider-issued account reference. Only the adapter interprets it. */
   providerAccountRef: ExternalObservationRef;
+  /**
+   * Opaque credential reference for the connection this binding belongs to.
+   * The adapter resolves access/material via this reference — never a
+   * hardcoded value and never raw credential material. Two bindings from
+   * different connections carry different references and must never cross-resolve.
+   */
+  credentialRef: string;
   /** Human-readable account name for display (provider-derived, optional). */
   name?: string;
   /** Account metadata needed for ingestion (e.g. subtype), provider-neutral. */

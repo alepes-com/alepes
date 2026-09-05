@@ -2,7 +2,8 @@
 // knows the SQL for financial-data synchronization state.
 
 import { Pool } from "pg";
-import type { ExternalObservationRef, FinancialObservationId } from "@alepes/domain";
+import type { ExternalObservationRef, FinancialObservationId, AccountBalanceSnapshot } from "@alepes/domain";
+import { selectAccountBalance } from "@alepes/domain";
 import { ulid } from "./identity";
 import {
   type AccountBindingId,
@@ -13,6 +14,7 @@ import {
   type ReconcileSyncCycleInput,
   type ReconcileSyncCycleResult,
   type SyncCycleId,
+  StaleSyncCycleError,
 } from "./sync-ports";
 
 const T_BINDINGS = "account_bindings";
@@ -20,9 +22,23 @@ const T_CHECKPOINTS = "sync_checkpoints";
 const T_OBSERVATIONS = "financial_observations";
 const T_REFS = "observation_external_refs";
 const T_EVENTS = "observation_events";
+const T_SNAPSHOTS = "account_balance_snapshots";
 
 export interface SyncPostgresConfig {
   connectionString: string;
+}
+
+/** A deterministic 32-bit advisory-lock key derived from the binding id. */
+function advisoryLockKey(bindingId: AccountBindingId): number {
+  // FNV-1a over the binding id string → 32-bit unsigned, stable across nodes.
+  let h = 0x811c9dc5;
+  const s = String(bindingId);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  // Map into PostgreSQL's signed 32-bit bigint advisory-lock space.
+  return (h >>> 0) - 0x80000000;
 }
 
 function newObservationId(): FinancialObservationId {
@@ -38,13 +54,20 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
     credentialRef: string;
     metadata: Record<string, string>;
   }): Promise<PersistedAccountBinding> {
-    const id = ulid() as AccountBindingId;
+    // Re-binding the same provider/account with a NEW credential reference must
+    // retain the SAME Alepes binding id, update the credential_ref + metadata,
+    // and reactivate the binding — while never persisting the secret itself
+    // (only the opaque reference is stored).
     const res = await pool.query(
-      `INSERT INTO ${T_BINDINGS} (id, provider_id, provider_account_ref, credential_ref, metadata)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (provider_id, provider_account_ref) DO UPDATE SET updated_at = now()
+      `INSERT INTO ${T_BINDINGS} (id, provider_id, provider_account_ref, credential_ref, metadata, active)
+       VALUES ($1, $2, $3, $4, $5, true)
+       ON CONFLICT (provider_id, provider_account_ref) DO UPDATE
+         SET credential_ref = EXCLUDED.credential_ref,
+             metadata = EXCLUDED.metadata,
+             active = true,
+             updated_at = now()
        RETURNING id, provider_id, provider_account_ref, credential_ref, metadata, active, created_at, updated_at`,
-      [id, input.providerId, input.providerAccountRef, input.credentialRef, JSON.stringify(input.metadata)]
+      [ulid(), input.providerId, input.providerAccountRef, input.credentialRef, JSON.stringify(input.metadata)]
     );
     const row = res.rows[0];
     return {
@@ -98,6 +121,51 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
     try {
       await client.query("BEGIN");
 
+      // Serialize reconciliation per account binding with a transaction-scoped
+      // advisory lock, then verify the cycle is not stale before applying ANY
+      // change. Provider network I/O is already complete (and lives outside this
+      // transaction); here we only guard the commit against a cursor racing ahead.
+      const bindingKey = advisoryLockKey(input.accountBindingId);
+      await client.query("SELECT pg_advisory_xact_lock($1)", [bindingKey]);
+
+      // Authoritative cursor; no checkpoint row means the binding has never
+      // completed a cycle, so the authoritative cursor is "".
+      const cur = await client.query(
+        `SELECT cursor FROM ${T_CHECKPOINTS} WHERE account_binding_id = $1`,
+        [input.accountBindingId]
+      );
+      const authoritativeCursor = cur.rows.length > 0 ? (cur.rows[0].cursor ?? "") : "";
+      if (authoritativeCursor !== input.startingCursor) {
+        throw new StaleSyncCycleError(
+          input.accountBindingId,
+          input.startingCursor,
+          authoritativeCursor
+        );
+      }
+
+      // Persist the account balance snapshot (if the cycle carries one) and
+      // resolve the SELECTED balance (available ?? current) used to qualify
+      // incoming-cash observations in this cycle. This is ACCOUNT level, not a
+      // per-transaction "balance after".
+      const snapshot: AccountBalanceSnapshot | undefined = input.delta.accountBalance;
+      const qualificationBalanceCents = snapshot ? selectAccountBalance(snapshot) : null;
+      if (snapshot) {
+        await client.query(
+          `INSERT INTO ${T_SNAPSHOTS} (sync_cycle_id, account_binding_id, available_cents, current_cents, captured_at, is_cached, normalization_version)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)
+           ON CONFLICT (sync_cycle_id) DO NOTHING`,
+          [
+            input.cycleId,
+            input.accountBindingId,
+            snapshot.availableCents ?? null,
+            snapshot.currentCents,
+            snapshot.capturedAt,
+            snapshot.isCachedByProvider,
+            snapshot.normalizationVersion,
+          ]
+        );
+      }
+
       // Resolve predecessor linkage: pending → posted via provider predecessor ref.
       const predecessorIdByRef = new Map<string, string>();
       for (const obs of input.delta.added.concat(input.delta.modified)) {
@@ -120,17 +188,17 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
           // Idempotent: already present, reconcile rather than create a new identity.
           const oid = existing.rows[0].financial_observation_id as FinancialObservationId;
           await client.query(
-            `UPDATE ${T_OBSERVATIONS} SET amount_cents=$2, direction=$3, status=$4, posted_at=$5, description=$6, normalization_version=$7, balance_after_cents=$8, updated_at=now() WHERE id=$1`,
-            [oid, obs.amountCents, obs.direction, obs.status, obs.postedAt ?? null, obs.description, obs.normalizationVersion, obs.balanceAfterCents ?? null]
+            `UPDATE ${T_OBSERVATIONS} SET amount_cents=$2, direction=$3, status=$4, posted_at=$5, description=$6, normalization_version=$7, qualification_balance_cents=$8, last_reconciled_cycle_id=$9, updated_at=now() WHERE id=$1`,
+            [oid, obs.amountCents, obs.direction, obs.status, obs.postedAt ?? null, obs.description, obs.normalizationVersion, qualificationBalanceCents, input.cycleId]
           );
           modified.push(oid);
         } else {
           const oid = newObservationId();
           const predId = obs.predecessorRef ? (predecessorIdByRef.get(obs.externalRef as string) ?? null) : null;
           await client.query(
-            `INSERT INTO ${T_OBSERVATIONS} (id, account_binding_id, amount_cents, direction, status, first_observed_at, posted_at, description, normalization_version, state, predecessor_observation_id, balance_after_cents)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11)`,
-            [oid, input.accountBindingId, obs.amountCents, obs.direction, obs.status, obs.firstObservedAt, obs.postedAt ?? null, obs.description, obs.normalizationVersion, predId, obs.balanceAfterCents ?? null]
+            `INSERT INTO ${T_OBSERVATIONS} (id, account_binding_id, amount_cents, direction, status, first_observed_at, posted_at, description, normalization_version, state, predecessor_observation_id, qualification_balance_cents, last_reconciled_cycle_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11,$12)`,
+            [oid, input.accountBindingId, obs.amountCents, obs.direction, obs.status, obs.firstObservedAt, obs.postedAt ?? null, obs.description, obs.normalizationVersion, predId, qualificationBalanceCents, input.cycleId]
           );
           await client.query(
             `INSERT INTO ${T_REFS} (account_binding_id, external_ref, financial_observation_id) VALUES ($1,$2,$3)`,
@@ -151,9 +219,9 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
           // Explicit, deterministic handling: record without inventing history.
           const oid = newObservationId();
           await client.query(
-            `INSERT INTO ${T_OBSERVATIONS} (id, account_binding_id, amount_cents, direction, status, first_observed_at, posted_at, description, normalization_version, state, balance_after_cents)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10)`,
-            [oid, input.accountBindingId, obs.amountCents, obs.direction, obs.status, obs.firstObservedAt, obs.postedAt ?? null, obs.description, obs.normalizationVersion, obs.balanceAfterCents ?? null]
+            `INSERT INTO ${T_OBSERVATIONS} (id, account_binding_id, amount_cents, direction, status, first_observed_at, posted_at, description, normalization_version, state, qualification_balance_cents, last_reconciled_cycle_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11)`,
+            [oid, input.accountBindingId, obs.amountCents, obs.direction, obs.status, obs.firstObservedAt, obs.postedAt ?? null, obs.description, obs.normalizationVersion, qualificationBalanceCents, input.cycleId]
           );
           await client.query(
             `INSERT INTO ${T_REFS} (account_binding_id, external_ref, financial_observation_id) VALUES ($1,$2,$3)`,
@@ -168,8 +236,8 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
             [oid]
           );
           await client.query(
-            `UPDATE ${T_OBSERVATIONS} SET amount_cents=$2, direction=$3, status=$4, posted_at=$5, description=$6, normalization_version=$7, balance_after_cents=$8, updated_at=now() WHERE id=$1`,
-            [oid, obs.amountCents, obs.direction, obs.status, obs.postedAt ?? null, obs.description, obs.normalizationVersion, obs.balanceAfterCents ?? null]
+            `UPDATE ${T_OBSERVATIONS} SET amount_cents=$2, direction=$3, status=$4, posted_at=$5, description=$6, normalization_version=$7, qualification_balance_cents=$8, last_reconciled_cycle_id=$9, updated_at=now() WHERE id=$1`,
+            [oid, obs.amountCents, obs.direction, obs.status, obs.postedAt ?? null, obs.description, obs.normalizationVersion, qualificationBalanceCents, input.cycleId]
           );
           await appendEvent(client, oid, input.cycleId, "modified", prevRow.rows[0] ?? null, obs, input.normalizationVersion);
           modified.push(oid);
@@ -248,7 +316,7 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
 
   async function listActiveObservations(accountBindingId: AccountBindingId): Promise<PersistedObservation[]> {
     const res = await pool.query(
-      `SELECT id, account_binding_id, amount_cents, direction, status, balance_after_cents, first_observed_at, posted_at, description, normalization_version, state, predecessor_observation_id, created_at, updated_at
+      `SELECT id, account_binding_id, amount_cents, direction, status, qualification_balance_cents, last_reconciled_cycle_id, first_observed_at, posted_at, description, normalization_version, state, predecessor_observation_id, created_at, updated_at
          FROM ${T_OBSERVATIONS} WHERE account_binding_id = $1 AND state = 'active' ORDER BY created_at`,
       [accountBindingId]
     );
@@ -258,13 +326,14 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
       amountCents: Number(row.amount_cents),
       direction: row.direction,
       status: row.status,
-      balanceAfterCents: row.balance_after_cents === null ? null : Number(row.balance_after_cents),
+      qualificationBalanceCents: row.qualification_balance_cents === null ? null : Number(row.qualification_balance_cents),
       firstObservedAt: new Date(row.first_observed_at).toISOString(),
       postedAt: row.posted_at ? new Date(row.posted_at).toISOString() : null,
       description: row.description,
       normalizationVersion: row.normalization_version,
       state: row.state,
       predecessorObservationId: row.predecessor_observation_id as FinancialObservationId | null,
+      lastReconciledCycleId: (row.last_reconciled_cycle_id as SyncCycleId | null) ?? null,
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString(),
     }));

@@ -11,6 +11,7 @@ import {
   plaidTransaction,
   removedTransaction,
   syncResponse,
+  plaidAccountWithBalances,
 } from "./fixtures";
 import type { AccountBinding } from "@alepes/integration-runtime";
 import type { ExternalObservationRef } from "@alepes/domain";
@@ -123,12 +124,12 @@ describe("Plaid adapter sync translation", () => {
   });
 
   it("classifies pagination-mutation error as restart_sync", async () => {
-    const { provider } = makeProvider([]);
-    const clientRef = provider as unknown as { client?: never };
-    void clientRef;
-    // Build a provider whose client throws a mutation error.
+    // Build a provider whose client throws a mutation error. Discover injects an
+    // account so the binding carries a credential reference (required to reach
+    // syncObservations).
     const throwing = createPlaidFinancialDataProvider({
       resolveAccessToken: async () => "tok",
+      discover: async () => [{ accountId: "acct-1", name: "Checking" }],
       client: {
         transactionsSync: async () => {
           throw new Error("transactions data mutated during pagination");
@@ -166,5 +167,63 @@ describe("Plaid adapter sync translation", () => {
     const b = await firstBinding(provider);
     const d = await provider.syncObservations(b, "");
     expect(d.added[0].normalizationVersion).toBe(PLAID_NORMALIZATION_VERSION);
+  });
+
+  it("resolves the credential reference carried on the binding (never hardcoded, never cross-resolved)", async () => {
+    // Track which credential reference the adapter asked to resolve.
+    const resolved: string[] = [];
+    const provider = createPlaidFinancialDataProvider({
+      resolveAccessToken: async (ref) => {
+        resolved.push(ref);
+        return `token-for-${ref}`;
+      },
+      discover: async () => [
+        { accountId: "acct-a", name: "A" },
+        { accountId: "acct-b", name: "B" },
+      ],
+      client: {
+        transactionsSync: async () => ({
+          data: syncResponse({ added: [incomingPlaidTransaction("t-1")] }),
+        }),
+      },
+    });
+
+    const bindingA = (await provider.discoverAccounts("cred:a"))[0];
+    const bindingB = (await provider.discoverAccounts("cred:b"))[1];
+
+    // Each binding carries its own credential reference.
+    expect(bindingA.credentialRef).toBe("cred:a");
+    expect(bindingB.credentialRef).toBe("cred:b");
+
+    await provider.syncObservations(bindingA, "");
+    expect(resolved).toContain("cred:a");
+    expect(resolved).not.toContain("cred:b");
+
+    await provider.syncObservations(bindingB, "");
+    expect(resolved).toContain("cred:b");
+    // The adapter never hardcodes a credential reference.
+    expect(resolved).not.toContain("cred:test");
+  });
+
+  it("asserts the account balance snapshot (not a per-transaction balance) flows from Plaid account data", async () => {
+    const provider = createPlaidFinancialDataProvider({
+      resolveAccessToken: async () => "tok",
+      discover: async () => [{ accountId: "acct-1", name: "Checking" }],
+      client: {
+        transactionsSync: async () => ({
+          data: syncResponse({
+            added: [incomingPlaidTransaction("t-in", -800.0)],
+            accounts: [plaidAccountWithBalances({ available: 5000, current: 4900 }) as never],
+          }),
+        }),
+      },
+    });
+    const b = (await provider.discoverAccounts("cred:a"))[0];
+    const d = await provider.syncObservations(b, "");
+    expect(d.accountBalance).toBeDefined();
+    expect(d.accountBalance!.availableCents).toBe(500_000);
+    expect(d.accountBalance!.currentCents).toBe(490_000);
+    // The observation does NOT carry a fabricated per-transaction balance.
+    expect("balanceAfterCents" in d.added[0]).toBe(false);
   });
 });
