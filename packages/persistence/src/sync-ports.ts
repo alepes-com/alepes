@@ -53,6 +53,8 @@ export interface PersistedObservation {
   amountCents: number;
   direction: "credit" | "debit";
   status: "pending" | "posted";
+  /** Provider-reported balance-after fact (nullable; qualification needs it). */
+  balanceAfterCents: number | null;
   firstObservedAt: string;
   postedAt: string | null;
   description: string;

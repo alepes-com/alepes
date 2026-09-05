@@ -5,7 +5,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { runMigrations } from "./migrations";
 import { createSyncPostgresStore } from "./sync-postgres";
 import type { ProviderSyncStore, AccountBindingId, SyncCycleId } from "./sync-ports";
-import { cents } from "@alepes/money";
+import { cents, nonNegativeCents } from "@alepes/money";
 import type {
   ExternalObservationRef,
   FinancialObservation,
@@ -42,9 +42,10 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
   });
 
   function obs(
-    overrides: Omit<Partial<FinancialObservation>, "externalRef" | "amountCents"> & {
+    overrides: Omit<Partial<FinancialObservation>, "externalRef" | "amountCents" | "balanceAfterCents"> & {
       externalRef: string;
       amountCents?: number;
+      balanceAfterCents?: number;
     }
   ): FinancialObservation {
     return {
@@ -58,6 +59,9 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
       postedAt: overrides.status === "pending" ? undefined : "2026-09-01T00:00:00Z",
       description: overrides.description ?? "record",
       normalizationVersion: "norm@1",
+      ...(overrides.balanceAfterCents !== undefined
+        ? { balanceAfterCents: nonNegativeCents(overrides.balanceAfterCents) }
+        : {}),
       ...(overrides.predecessorRef
         ? { predecessorRef: overrides.predecessorRef as ExternalObservationRef }
         : {}),
@@ -296,5 +300,18 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
     );
     expect(rows.rows).toHaveLength(1);
     await pool.end();
+  });
+
+  it("16. balance-after is persisted and read back for downstream qualification", async () => {
+    const b = await bind();
+    await store.reconcileSyncCycle({
+      accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
+      // balanceAfterCents is a provider fact that qualification requires downstream.
+      delta: delta({ added: [obs({ externalRef: "t1", balanceAfterCents: 5000_00 })] }),
+      nextCursor: "c1",
+    });
+    const active = await store.listActiveObservations(b.id);
+    expect(active).toHaveLength(1);
+    expect(active[0].balanceAfterCents).toBe(500000);
   });
 });

@@ -120,17 +120,17 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
           // Idempotent: already present, reconcile rather than create a new identity.
           const oid = existing.rows[0].financial_observation_id as FinancialObservationId;
           await client.query(
-            `UPDATE ${T_OBSERVATIONS} SET amount_cents=$2, direction=$3, status=$4, posted_at=$5, description=$6, normalization_version=$7, updated_at=now() WHERE id=$1`,
-            [oid, obs.amountCents, obs.direction, obs.status, obs.postedAt ?? null, obs.description, obs.normalizationVersion]
+            `UPDATE ${T_OBSERVATIONS} SET amount_cents=$2, direction=$3, status=$4, posted_at=$5, description=$6, normalization_version=$7, balance_after_cents=$8, updated_at=now() WHERE id=$1`,
+            [oid, obs.amountCents, obs.direction, obs.status, obs.postedAt ?? null, obs.description, obs.normalizationVersion, obs.balanceAfterCents ?? null]
           );
           modified.push(oid);
         } else {
           const oid = newObservationId();
           const predId = obs.predecessorRef ? (predecessorIdByRef.get(obs.externalRef as string) ?? null) : null;
           await client.query(
-            `INSERT INTO ${T_OBSERVATIONS} (id, account_binding_id, amount_cents, direction, status, first_observed_at, posted_at, description, normalization_version, state, predecessor_observation_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10)`,
-            [oid, input.accountBindingId, obs.amountCents, obs.direction, obs.status, obs.firstObservedAt, obs.postedAt ?? null, obs.description, obs.normalizationVersion, predId]
+            `INSERT INTO ${T_OBSERVATIONS} (id, account_binding_id, amount_cents, direction, status, first_observed_at, posted_at, description, normalization_version, state, predecessor_observation_id, balance_after_cents)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11)`,
+            [oid, input.accountBindingId, obs.amountCents, obs.direction, obs.status, obs.firstObservedAt, obs.postedAt ?? null, obs.description, obs.normalizationVersion, predId, obs.balanceAfterCents ?? null]
           );
           await client.query(
             `INSERT INTO ${T_REFS} (account_binding_id, external_ref, financial_observation_id) VALUES ($1,$2,$3)`,
@@ -151,9 +151,9 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
           // Explicit, deterministic handling: record without inventing history.
           const oid = newObservationId();
           await client.query(
-            `INSERT INTO ${T_OBSERVATIONS} (id, account_binding_id, amount_cents, direction, status, first_observed_at, posted_at, description, normalization_version, state)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active')`,
-            [oid, input.accountBindingId, obs.amountCents, obs.direction, obs.status, obs.firstObservedAt, obs.postedAt ?? null, obs.description, obs.normalizationVersion]
+            `INSERT INTO ${T_OBSERVATIONS} (id, account_binding_id, amount_cents, direction, status, first_observed_at, posted_at, description, normalization_version, state, balance_after_cents)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10)`,
+            [oid, input.accountBindingId, obs.amountCents, obs.direction, obs.status, obs.firstObservedAt, obs.postedAt ?? null, obs.description, obs.normalizationVersion, obs.balanceAfterCents ?? null]
           );
           await client.query(
             `INSERT INTO ${T_REFS} (account_binding_id, external_ref, financial_observation_id) VALUES ($1,$2,$3)`,
@@ -168,8 +168,8 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
             [oid]
           );
           await client.query(
-            `UPDATE ${T_OBSERVATIONS} SET amount_cents=$2, direction=$3, status=$4, posted_at=$5, description=$6, normalization_version=$7, updated_at=now() WHERE id=$1`,
-            [oid, obs.amountCents, obs.direction, obs.status, obs.postedAt ?? null, obs.description, obs.normalizationVersion]
+            `UPDATE ${T_OBSERVATIONS} SET amount_cents=$2, direction=$3, status=$4, posted_at=$5, description=$6, normalization_version=$7, balance_after_cents=$8, updated_at=now() WHERE id=$1`,
+            [oid, obs.amountCents, obs.direction, obs.status, obs.postedAt ?? null, obs.description, obs.normalizationVersion, obs.balanceAfterCents ?? null]
           );
           await appendEvent(client, oid, input.cycleId, "modified", prevRow.rows[0] ?? null, obs, input.normalizationVersion);
           modified.push(oid);
@@ -248,7 +248,7 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
 
   async function listActiveObservations(accountBindingId: AccountBindingId): Promise<PersistedObservation[]> {
     const res = await pool.query(
-      `SELECT id, account_binding_id, amount_cents, direction, status, first_observed_at, posted_at, description, normalization_version, state, predecessor_observation_id, created_at, updated_at
+      `SELECT id, account_binding_id, amount_cents, direction, status, balance_after_cents, first_observed_at, posted_at, description, normalization_version, state, predecessor_observation_id, created_at, updated_at
          FROM ${T_OBSERVATIONS} WHERE account_binding_id = $1 AND state = 'active' ORDER BY created_at`,
       [accountBindingId]
     );
@@ -258,6 +258,7 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
       amountCents: Number(row.amount_cents),
       direction: row.direction,
       status: row.status,
+      balanceAfterCents: row.balance_after_cents === null ? null : Number(row.balance_after_cents),
       firstObservedAt: new Date(row.first_observed_at).toISOString(),
       postedAt: row.posted_at ? new Date(row.posted_at).toISOString() : null,
       description: row.description,
