@@ -7,8 +7,12 @@ brokerage, define rules for how incoming cash should be allocated, and let new
 money rebalance your portfolio — contribution by contribution, without
 unnecessary selling.
 
-This repository is the **frontend MVP** for `alepes.com`. It uses mock data and
-simulated integrations; no real bank or brokerage is connected.
+This repository (`alepes-com/alepes`) is the **canonical Alepes product/platform
+repository**: the financial domain, the `packages/` engines (money, domain, rules,
+allocation, execution-policy, integration-runtime, persistence, reconciliation,
+Temporal workflows, analytics), and the host application. The public
+product-preview website lives separately at `alepes-com/website` and is served
+from `alepes.com`.
 
 > Alepes provides automation infrastructure, not investment advice. You define
 > the investment universe, target allocations, and rules. Alepes executes them.
