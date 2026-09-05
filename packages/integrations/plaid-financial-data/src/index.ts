@@ -43,6 +43,8 @@ export interface PlaidTransactionsSyncClient {
     access_token: string;
     cursor?: string;
     count?: number;
+    /** Account-scoped sync: Plaid treats each account_id as its own stream+cursor. */
+    options?: { account_id?: string };
   }): Promise<{ data: TransactionsSyncResponse }>;
 }
 
@@ -155,19 +157,41 @@ export function createPlaidFinancialDataProvider(
 
     async syncObservations(binding: AccountBinding, cursor: string): Promise<ObservationSyncDelta> {
       const accessToken = await resolveAccessToken(binding.credentialRef);
+      const accountId = binding.providerAccountRef as string;
       let resp: { data: TransactionsSyncResponse };
       try {
-        resp = await client.transactionsSync({ access_token: accessToken, cursor, ...(count ? { count } : {}) });
+        // Account-scoped request: the bound Plaid account_id gets its OWN
+        // incremental stream + cursor. Never issue an Item-wide sync for an
+        // account-scoped Alepes binding.
+        resp = await client.transactionsSync({
+          access_token: accessToken,
+          cursor,
+          ...(count ? { count } : {}),
+          options: { account_id: accountId },
+        });
       } catch (err) {
         throw classifyPlaidError(err);
       }
 
       const data = resp.data;
-      // Normalize the account balance snapshot (account-level, NOT a per-transaction
-      // "balance after"). Plaid reports balances alongside account data; this is the
-      // balance used to qualify incoming-cash observations in this cycle. Selection
-      // of available-vs-current happens downstream in selectAccountBalance.
-      const accountBalance = normalizeAccountBalance(binding.id, data.accounts, PLAID_NORMALIZATION_VERSION);
+      // Ownership validation: every returned transaction must belong to the bound
+      // account. A cross-account record despite an account-scoped request is an
+      // invariant violation — fail rather than silently rebinding it.
+      for (const t of data.added.concat(data.modified)) {
+        if (t.account_id !== accountId) {
+          throw new ProviderError(
+            "invalid_request",
+            `transaction ${t.transaction_id} belongs to account ${t.account_id}, not ${accountId}`
+          );
+        }
+      }
+
+      const accountBalance = normalizeAccountBalance(
+        binding.id,
+        accountId,
+        data.accounts,
+        PLAID_NORMALIZATION_VERSION
+      );
       return {
         added: data.added.map((t) => toObservation(binding.id, t, PLAID_NORMALIZATION_VERSION)),
         modified: data.modified.map((t) => toObservation(binding.id, t, PLAID_NORMALIZATION_VERSION)),
@@ -182,24 +206,27 @@ export function createPlaidFinancialDataProvider(
 
 /**
  * Pull an Alepes AccountBalanceSnapshot out of the Plaid response's `accounts`
- * array (the first depository account). Returns undefined when no usable balance
- * is present — qualification then defers rather than fabricating a balance.
+ * array for the BOUND account only. Returns undefined when the bound account is
+ * absent or has no usable balance — qualification then defers rather than
+ * borrowing another account's balance.
  */
 function normalizeAccountBalance(
   bindingId: string,
-  accounts: Array<{ balances?: { available?: number | null; current?: number | null } | null }>,
+  accountId: string,
+  accounts: Array<{ account_id?: string; balances?: { available?: number | null; current?: number | null } | null }>,
   normalizationVersion: string
 ): AccountBalanceSnapshot | undefined {
-  const acct = accounts.find((a) => a?.balances && (a.balances.current != null || a.balances.available != null));
+  const acct = accounts.find((a) => a?.account_id === accountId);
   if (!acct?.balances) return undefined;
   const current = acct.balances.current;
-  if (current == null && acct.balances.available == null) return undefined;
+  const available = acct.balances.available;
+  if (current == null && available == null) return undefined;
   return {
     accountBindingId: bindingId,
-    ...(acct.balances.available != null
-      ? { availableCents: nonNegativeCents(Math.round(acct.balances.available * 100)) }
+    ...(available != null
+      ? { availableCents: nonNegativeCents(Math.round(available * 100)) }
       : {}),
-    currentCents: nonNegativeCents(Math.round((current ?? acct.balances.available!) * 100)),
+    currentCents: nonNegativeCents(Math.round((current ?? available!) * 100)),
     capturedAt: new Date().toISOString(),
     // Balances returned alongside /transactions/sync are cached by the provider.
     isCachedByProvider: true,

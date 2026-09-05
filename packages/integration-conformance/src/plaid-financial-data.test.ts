@@ -14,6 +14,7 @@ import {
 // documents, not SDK types.
 interface PlaidShapedTransaction {
   transaction_id: string;
+  account_id: string;
   amount: number;
   pending: boolean;
   pending_transaction_id: string | null;
@@ -22,9 +23,12 @@ interface PlaidShapedTransaction {
   name: string;
 }
 
+const CONFORMANCE_ACCOUNT_ID = "acct-1";
+
 function shapedTx(id: string, amountDollars: number, pending = false): PlaidShapedTransaction {
   return {
     transaction_id: id,
+    account_id: CONFORMANCE_ACCOUNT_ID,
     amount: amountDollars,
     pending,
     pending_transaction_id: null,

@@ -170,8 +170,10 @@ describe("Plaid adapter sync translation", () => {
   });
 
   it("resolves the credential reference carried on the binding (never hardcoded, never cross-resolved)", async () => {
-    // Track which credential reference the adapter asked to resolve.
+    // Track which credential reference the adapter asked to resolve, and echo the
+    // requested account scope back with a matching transaction.
     const resolved: string[] = [];
+    const lastAccountId: string[] = [];
     const provider = createPlaidFinancialDataProvider({
       resolveAccessToken: async (ref) => {
         resolved.push(ref);
@@ -182,9 +184,15 @@ describe("Plaid adapter sync translation", () => {
         { accountId: "acct-b", name: "B" },
       ],
       client: {
-        transactionsSync: async () => ({
-          data: syncResponse({ added: [incomingPlaidTransaction("t-1")] }),
-        }),
+        transactionsSync: async (req) => {
+          const accountId = req.options?.account_id ?? "";
+          lastAccountId.push(accountId);
+          return {
+            data: syncResponse({
+              added: [{ ...incomingPlaidTransaction("t-1"), account_id: accountId }],
+            }),
+          };
+        },
       },
     });
 
@@ -198,9 +206,13 @@ describe("Plaid adapter sync translation", () => {
     await provider.syncObservations(bindingA, "");
     expect(resolved).toContain("cred:a");
     expect(resolved).not.toContain("cred:b");
+    // The request was scoped to binding A's account.
+    expect(lastAccountId).toContain("acct-a");
 
     await provider.syncObservations(bindingB, "");
     expect(resolved).toContain("cred:b");
+    // The request was scoped to binding B's account.
+    expect(lastAccountId).toContain("acct-b");
     // The adapter never hardcodes a credential reference.
     expect(resolved).not.toContain("cred:test");
   });
@@ -225,5 +237,124 @@ describe("Plaid adapter sync translation", () => {
     expect(d.accountBalance!.currentCents).toBe(490_000);
     // The observation does NOT carry a fabricated per-transaction balance.
     expect("balanceAfterCents" in d.added[0]).toBe(false);
+  });
+});
+
+describe("Plaid adapter — account scoping (one Item, multiple accounts)", () => {
+  const CHECKING = "acct-checking";
+  const SAVINGS = "acct-savings";
+
+  function scopedProvider(overrides?: {
+    checkingBalance?: { available?: number | null; current: number } | null;
+    savingsBalance?: { available?: number | null; current: number } | null;
+  }) {
+    const requested: Array<{ token: string; accountId?: string; cursor?: string }> = [];
+    const provider = createPlaidFinancialDataProvider({
+      resolveAccessToken: async (ref) => `token-${ref}`,
+      discover: async () => [
+        { accountId: CHECKING, name: "Checking" },
+        { accountId: SAVINGS, name: "Savings" },
+      ],
+      client: {
+        transactionsSync: async (req) => {
+          requested.push({ token: req.access_token, accountId: req.options?.account_id, cursor: req.cursor });
+          const scope = req.options?.account_id;
+          const accounts = [];
+          if (overrides?.checkingBalance !== null) {
+            accounts.push(plaidAccountWithBalances({
+              accountId: CHECKING,
+              available: overrides?.checkingBalance?.available ?? 1000,
+              current: overrides?.checkingBalance?.current ?? 999,
+            }));
+          }
+          if (overrides?.savingsBalance !== null) {
+            accounts.push(plaidAccountWithBalances({
+              accountId: SAVINGS,
+              available: overrides?.savingsBalance?.available ?? 5000,
+              current: overrides?.savingsBalance?.current ?? 4999,
+            }));
+          }
+          const added = scope
+            ? [{ ...incomingPlaidTransaction(`${scope}-txn`, -50), account_id: scope }]
+            : [];
+          return { data: syncResponse({ added, accounts: accounts as never[], next_cursor: `cursor-${scope}`, has_more: false }) };
+        },
+      },
+    });
+    return { provider, requested };
+  }
+
+  it("sends options.account_id = the bound account for each binding, and cursors stay independent", async () => {
+    const { provider, requested } = scopedProvider();
+    const checking = (await provider.discoverAccounts("cred:c"))[0];
+    const savings = (await provider.discoverAccounts("cred:c"))[1];
+
+    const dc = await provider.syncObservations(checking, "c0");
+    const ds = await provider.syncObservations(savings, "s0");
+
+    // Each request carried the bound account_id.
+    expect(requested[0].accountId).toBe(CHECKING);
+    expect(requested[1].accountId).toBe(SAVINGS);
+    // Each binding advanced its own cursor independently.
+    expect(requested[0].cursor).toBe("c0");
+    expect(requested[1].cursor).toBe("s0");
+    expect(dc.nextCursor).toBe(`cursor-${CHECKING}`);
+    expect(ds.nextCursor).toBe(`cursor-${SAVINGS}`);
+  });
+
+  it("checking transactions cannot appear under the savings binding (and vice versa)", async () => {
+    const { provider } = scopedProvider();
+    const checking = (await provider.discoverAccounts("cred:c"))[0];
+    const savings = (await provider.discoverAccounts("cred:c"))[1];
+
+    const dc = await provider.syncObservations(checking, "");
+    const ds = await provider.syncObservations(savings, "");
+
+    // Each observation is scoped to its own binding's account.
+    expect(dc.added[0].accountBindingId).toBe(checking.id);
+    expect(ds.added[0].accountBindingId).toBe(savings.id);
+    expect(dc.added[0].externalRef).toContain(CHECKING);
+    expect(ds.added[0].externalRef).toContain(SAVINGS);
+  });
+
+  it("checking uses checking balance only; savings uses savings balance only", async () => {
+    const { provider } = scopedProvider({
+      checkingBalance: { current: 1111 },
+      savingsBalance: { current: 2222 },
+    });
+    const checking = (await provider.discoverAccounts("cred:c"))[0];
+    const savings = (await provider.discoverAccounts("cred:c"))[1];
+
+    const dc = await provider.syncObservations(checking, "");
+    const ds = await provider.syncObservations(savings, "");
+
+    expect(dc.accountBalance!.currentCents).toBe(1111_00);
+    expect(ds.accountBalance!.currentCents).toBe(2222_00);
+  });
+
+  it("missing checking balance does not fall back to savings balance", async () => {
+    const { provider } = scopedProvider({ checkingBalance: null, savingsBalance: { current: 2222 } });
+    const checking = (await provider.discoverAccounts("cred:c"))[0];
+
+    const dc = await provider.syncObservations(checking, "");
+    // No accountBalance snapshot: qualification should defer, not borrow savings.
+    expect(dc.accountBalance).toBeUndefined();
+  });
+
+  it("a mismatched transaction account_id fails as an invariant error (never silently rebound)", async () => {
+    const provider = createPlaidFinancialDataProvider({
+      resolveAccessToken: async () => "tok",
+      discover: async () => [{ accountId: CHECKING, name: "Checking" }],
+      client: {
+        transactionsSync: async () => ({
+          data: syncResponse({
+            // Provider returned a SAVINGS transaction despite a CHECKING-scoped request.
+            added: [{ ...incomingPlaidTransaction("savings-txn"), account_id: SAVINGS }],
+          }),
+        }),
+      },
+    });
+    const checking = (await provider.discoverAccounts("cred:c"))[0];
+    await expect(provider.syncObservations(checking, "")).rejects.toMatchObject({ kind: "invalid_request" });
   });
 });
