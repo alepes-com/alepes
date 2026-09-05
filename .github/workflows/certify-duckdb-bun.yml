@@ -55,4 +55,4 @@ jobs:
         run: bun packages/analytics/test/duckdb-bun-compat.ts
 
       - name: Run analytics test suite
-        run: bun test packages/analytics/
+        run: bun run test packages/analytics/

@@ -281,10 +281,14 @@ validation interface; Oxlint is the primary linter.
 ```bash
 bun run lint         # oxlint (0 errors required)
 bunx tsc --noEmit    # typecheck the whole repo (src + packages)
-bun test             # vitest unit/property/conformance tests
+bun run test         # Vitest unit/property/conformance suites (the `test` script)
 bun run build        # Next production build (static prerender of all routes)
 git diff --check     # whitespace errors
 ```
+
+> `bun run test` executes the repo's `"test": "vitest run"` script. `bun test` is
+> Bun's own built-in runner and is NOT the canonical Alepes test command for the
+> Vitest suite.
 
 Persistence and Temporal have integration suites that require a live PostgreSQL
 (or the Temporal workflow isolate under Node 24) and run only when their env vars

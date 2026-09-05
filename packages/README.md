@@ -56,12 +56,15 @@ construction (orders are always `buy`, never `sell`).
 ## Tests
 
 ```bash
-# from the repo root — Bun is the validation interface
-bun test
+# from the repo root — Bun is the validation interface (runs the `vitest run` script)
+bun run test
 bun run build
 bunx tsc --noEmit
 bunx oxlint
 ```
+
+> `bun run test` runs the repo's Vitest suite. `bun test` is Bun's own built-in
+> runner and is not the canonical Alepes test command.
 
 The functional suite covers: allocations never exceed deployable; exact
 reconciliation after rounding; no negative allocation; overweight holdings

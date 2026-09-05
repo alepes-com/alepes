@@ -102,7 +102,7 @@ jobs:
           npx vitest run packages/persistence packages/temporal-workflows/src/activities.test.ts 2>&1 | tail -40
 
       - name: Full suite remains green (Bun interface)
-        run: bun test 2>&1 | tail -40
+        run: bun run test 2>&1 | tail -40
 
       - name: Typecheck (Bun interface)
         run: bunx tsc --noEmit
