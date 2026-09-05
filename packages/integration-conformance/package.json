@@ -13,6 +13,7 @@
     "@alepes/mock-bank": "*",
     "@alepes/mock-brokerage": "*",
     "@alepes/mock-financial-data": "*",
-    "@alepes/plaid-financial-data": "*"
+    "@alepes/plaid-financial-data": "*",
+    "@alepes/reconciliation": "*"
   }
 }

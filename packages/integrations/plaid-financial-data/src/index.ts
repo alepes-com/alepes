@@ -188,3 +188,14 @@ function classifyPlaidError(err: unknown): ProviderError {
   if (typeof status === "number" && status >= 500) return new ProviderError("provider_unavailable", message);
   return new ProviderError("unknown", message);
 }
+
+// ─── Deterministic fixtures (for conformance + e2e tests) ────────────────────
+// Plaid-typed internally; the public surface never exposes Plaid SDK values. The
+// adapter converts these into Alepes-owned normalized observations.
+export {
+  plaidTransaction,
+  removedTransaction,
+  syncResponse,
+  incomingPlaidTransaction,
+  outgoingPlaidTransaction,
+} from "./fixtures";

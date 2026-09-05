@@ -314,4 +314,23 @@ runIntegration("provider-sync persistence (real PostgreSQL)", () => {
     expect(active).toHaveLength(1);
     expect(active[0].balanceAfterCents).toBe(500000);
   });
+
+  it("17. persisted observation id is Alepes-minted and does NOT encode the external ref", async () => {
+    const b = await bind();
+    const providerId = "plaid-tx-secret-123"; // the raw provider identifier
+    await store.reconcileSyncCycle({
+      accountBindingId: b.id, cycleId: cycle(), normalizationVersion: "norm@1",
+      delta: delta({ added: [obs({ externalRef: providerId })] }),
+      nextCursor: "c1",
+    });
+    const active = await store.listActiveObservations(b.id);
+    expect(active).toHaveLength(1);
+    const persistedId = active[0].id;
+    // The durable Alepes id is ULID-based (obs_...), independent of the provider.
+    expect(persistedId.startsWith("obs_")).toBe(true);
+    // It does NOT embed the raw provider identifier.
+    expect(persistedId).not.toContain(providerId);
+    // And it is provably distinct from the adapter's provisional `obs-${ref}` id.
+    expect(persistedId).not.toBe(`obs-${providerId}`);
+  });
 });

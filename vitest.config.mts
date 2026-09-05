@@ -15,6 +15,7 @@ const packages = [
   "execution-policy",
   "integration-runtime",
   "persistence",
+  "reconciliation",
   "temporal-workflows",
 ];
 const alias: Record<string, string> = {
