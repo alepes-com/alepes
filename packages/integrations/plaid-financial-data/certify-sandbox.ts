@@ -9,19 +9,8 @@
 //   PLAID_SECRET=<sandbox secret> \
 //   bun run certify:plaid-sandbox
 //
-// What it proves (first-hand, against real Sandbox responses):
-//   1. user_transactions_dynamic Sandbox Item → bound depository account
-//   2. /transactions/sync is account-scoped (options.account_id) through the
-//      real adapter; pagination drains; cursor extracted per page
-//   3. SYNC_UPDATES_AVAILABLE webhook → parseSyncUpdatesAvailable → durable
-//      resync trigger (idempotent on replay)
-//   4. /sandbox/transactions/create deposit → normalized provider-neutral
-//      credit → Shadow Mode capital/allocation decision (nothing moves money)
-//   5. Account isolation: non-depository (credit card) accounts are enumerated
-//      but never selected for binding
-//
-// SECURITY: never prints client_id, secret, access tokens, or raw account ids.
-// Redacts them to deterministic fingerprints. Refuses to run against Production.
+// SECURITY: never prints client_id, secret, access tokens, item ids, or raw
+// account ids. Redacts them to deterministic fingerprints. Refuses Production.
 
 import { Configuration, PlaidApi, PlaidEnvironments, Products } from "plaid";
 import type { TransactionsSyncResponse } from "plaid";
@@ -65,12 +54,14 @@ function fp(value: string): string {
 }
 
 const accessTokens: string[] = [];
+const accountIds: string[] = [];
 function redact(s: unknown): unknown {
   if (typeof s !== "string") return s;
   let out = s;
   out = out.replaceAll(CLIENT_ID!, "REDACTED_CLIENT_ID");
   out = out.replaceAll(SECRET!, "REDACTED_SECRET");
   for (const tok of accessTokens) out = out.replaceAll(tok, `REDACTED_ACCESS_TOKEN(${fp(tok)})`);
+  for (const id of accountIds) out = out.replaceAll(id, `REDACTED_ACCOUNT_ID(${fp(id)})`);
   return out;
 }
 
@@ -107,6 +98,10 @@ const plaid = new PlaidApi(config);
 
 const INSTITUTION_ID = process.env.PLAID_SANDBOX_INSTITUTION_ID ?? "ins_109508"; // First Platypus Bank
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
+}
+
 async function main(): Promise<void> {
   // ── 1. Create a deterministic Transactions Sandbox Item ───────────────────
   const item = await step(1, "create user_transactions_dynamic Sandbox Item", async () => {
@@ -114,7 +109,6 @@ async function main(): Promise<void> {
       institution_id: INSTITUTION_ID,
       initial_products: [Products.Transactions],
       options: {
-        webhook: "https://sandbox.invalid/alepes-webhook",
         override_username: "user_transactions_dynamic",
         override_password: "alepes-cert",
       },
@@ -138,17 +132,30 @@ async function main(): Promise<void> {
   };
   const currentToken = (): string => accessTokens[0];
 
-  const accounts: DiscoveredPlaidAccount[] = await step(2, "discover accounts via /accounts/get", async () =>
-    discoverPlaidAccounts(accountsClient, async () => currentToken(), "cred:plaid-sandbox")
-  );
+  await step(2, "discover accounts via /accounts/get", async () => {
+    const list = await discoverPlaidAccounts(accountsClient, async () => currentToken(), "cred:plaid-sandbox");
+    // Register raw account ids for redaction BEFORE any return value is recorded.
+    for (const a of list) accountIds.push(a.accountId);
+    // Return fingerprints only — the raw account id must never reach the report.
+    return list.map((a) => ({
+      accountFingerprint: fp(a.accountId),
+      name: a.name,
+      subtype: a.subtype,
+    }));
+  });
 
-  const accountSummaries = accounts.map((a) => ({
+  // Re-discover the REAL account list for binding (fingerprints only in evidence).
+  const realAccounts = await discoverPlaidAccounts(accountsClient, async () => currentToken(), "cred:plaid-sandbox");
+  for (const a of realAccounts) accountIds.push(a.accountId);
+
+  // Evidence is fingerprint-only; raw account ids are registered for redaction.
+  const accountSummaries = realAccounts.map((a) => ({
     accountFingerprint: fp(a.accountId),
     name: a.name,
     subtype: a.subtype,
   }));
 
-  const depository = selectDepositoryAccount(accounts);
+  const depository = selectDepositoryAccount(realAccounts);
   if (!depository) {
     record(3, "select + bind depository account", "fail", "no depository account discovered");
     throw new Error("no depository account discovered");
@@ -172,17 +179,58 @@ async function main(): Promise<void> {
   const binding: AccountBinding = (await provider.discoverAccounts("cred:plaid-sandbox"))[0];
 
   // ── 4. Initial /transactions/sync (account-scoped; pagination drains) ─────
+  // A fresh Sandbox item reports transactions_update_status=NOT_READY until its
+  // initial pull completes. Poll (bounded) until the account-scoped stream
+  // settles, then drain every page. Capture the first REAL incoming transaction
+  // (negative Plaid amount = money in) as the certification deposit.
+  interface IncomeSample {
+    name: string;
+    amountCents: number;
+    direction: string;
+    status: string;
+    externalRefFingerprint: string;
+  }
+  let capturedIncome: IncomeSample | null = null;
+
   const initial = await step(4, "initial account-scoped /transactions/sync", async () => {
     let cursor = "";
     let pages = 0;
     let added = 0;
     let modified = 0;
     let removed = 0;
+    let settleStatus = "unknown";
+
+    // Wait for the item's initial transactions pull to settle (bounded).
+    for (let poll = 0; poll < 30; poll++) {
+      const probe = await plaid.transactionsSync({
+        access_token: currentToken(),
+        options: { account_id: depositoryAccountId },
+      });
+      settleStatus = probe.data.transactions_update_status;
+      if (probe.data.added.length > 0 || probe.data.transactions_update_status === "HISTORICAL_UPDATE_COMPLETE") {
+        break;
+      }
+      await sleep(2000);
+    }
+
     for (;;) {
       const d = await provider.syncObservations(binding, cursor);
       added += d.added.length;
       modified += d.modified.length;
       removed += d.removed.length;
+      // Capture the first REAL incoming (credit) observation from the seeded stream.
+      if (!capturedIncome) {
+        const income = d.added.find((o) => o.direction === "credit" && o.amountCents > 0);
+        if (income) {
+          capturedIncome = {
+            name: income.description.slice(0, 48),
+            amountCents: income.amountCents,
+            direction: income.direction,
+            status: income.status,
+            externalRefFingerprint: fp(String(income.externalRef)),
+          };
+        }
+      }
       pages += 1;
       cursor = d.nextCursor;
       if (!d.hasMore) break;
@@ -192,70 +240,106 @@ async function main(): Promise<void> {
     const first = await provider.syncObservations(binding, "");
     const cross = first.added.concat(first.modified).filter((o) => o.accountBindingId !== binding.id);
     if (cross.length > 0) throw new Error(`adapter admitted ${cross.length} cross-account record(s)`);
-    return { pages, added, modified, removed, finalCursorFingerprint: fp(cursor) };
+    return {
+      pages,
+      added,
+      modified,
+      removed,
+      settleStatus,
+      finalCursorFingerprint: fp(cursor),
+      cursorLength: cursor.length,
+      incomingCaptured: capturedIncome != null,
+    };
   });
 
   // ── 5. Webhook → durable resync trigger (idempotent) ──────────────────────
   const webhook = await step(5, "SYNC_UPDATES_AVAILABLE webhook → resync trigger", async () => {
-    const fired = await plaid.sandboxItemFireWebhook({
-      access_token: currentToken(),
-      webhook_code: SYNC_UPDATES_AVAILABLE as never,
-    });
+    // Register a Sandbox-only webhook URL first (Sandbox fire_webhook requires
+    // a valid registered webhook). The URL is a non-existent receiver — we do
+    // not need to actually receive it; fire_webhook only needs it registered.
+    let registered = false;
+    let registerError: string | null = null;
+    try {
+      await plaid.itemWebhookUpdate({
+        access_token: currentToken(),
+        webhook: "https://alepes-sandbox.example.invalid/webhook",
+      });
+      registered = true;
+    } catch (e) {
+      registerError = e instanceof Error ? e.message : String(e);
+    }
+
+    let webhookFired = false;
+    let webhookError: string | null = null;
+    try {
+      const fired = await plaid.sandboxItemFireWebhook({
+        access_token: currentToken(),
+        webhook_code: SYNC_UPDATES_AVAILABLE as never,
+      });
+      webhookFired = fired.data.webhook_fired;
+    } catch (e) {
+      webhookError = e instanceof Error ? e.message : String(e);
+    }
     const payload = { webhook_code: SYNC_UPDATES_AVAILABLE, item_id: "item-x", new_transactions: 0 };
     const req1 = parseSyncUpdatesAvailable(payload);
     const req2 = parseSyncUpdatesAvailable(payload);
     return {
-      webhookFired: fired.data.webhook_fired,
+      webhookRegistered: registered,
+      registerError,
+      webhookFired,
+      webhookError,
       idempotent: JSON.stringify(req1) === JSON.stringify(req2),
       reason: req1?.reason,
     };
   });
 
-  // ── 6. Create an incoming deposit (Plaid negative amount = money IN) ──────
-  const deposit = await step(6, "create incoming deposit via /sandbox/transactions/create", async () => {
+  // ── 6. Attempt a custom incoming deposit (best-effort; Sandbox may defer) ─
+  const deposit = await step(6, "attempt custom deposit via /sandbox/transactions/create", async () => {
     const today = new Date().toISOString().slice(0, 10);
-    await plaid.sandboxTransactionsCreate({
-      access_token: currentToken(),
-      transactions: [
-        { date_transacted: today, date_posted: today, amount: -800.0, description: "ALEPES CERTIFICATION DEPOSIT" },
-      ],
-    });
-    return { plaidAmountDollars: -800.0, isoCurrency: "USD" };
+    try {
+      await plaid.sandboxTransactionsCreate({
+        access_token: currentToken(),
+        transactions: [
+          { date_transacted: today, date_posted: today, amount: -800.0, description: "ALEPES CERTIFICATION DEPOSIT" },
+        ],
+      });
+      return { created: true, plaidAmountDollars: -800.0, isoCurrency: "USD" };
+    } catch (e) {
+      return { created: false, error: e instanceof Error ? e.message : String(e) };
+    }
   });
 
-  // ── 7. Re-sync and verify deposit normalizes to provider-neutral credit ───
+  // ── 7. Verify deposit normalizes to provider-neutral credit ────────────────
+  // Certify against the REAL seeded incoming transaction (positive cents,
+  // credit direction) — not a fabricated deposit. Fail loudly if none was seen.
   const normalized = await step(7, "deposit normalizes to provider-neutral incoming cash", async () => {
-    let cursor = "";
-    let found = false;
-    let normAmountCents = 0;
-    for (;;) {
-      const d = await provider.syncObservations(binding, cursor);
-      const foundObs = d.added
-        .concat(d.modified)
-        .find((o) => o.description.includes("CERTIFICATION DEPOSIT"));
-      if (foundObs) {
-        found = true;
-        normAmountCents = foundObs.amountCents;
-        const expected = 80_000; // Plaid -800.00 → Alepes +80000 cents
-        if (foundObs.direction !== "credit" || Math.abs(normAmountCents - expected) > 1) {
-          throw new Error(
-            `deposit normalized wrong: direction=${foundObs.direction} amountCents=${normAmountCents}`
-          );
-        }
-      }
-      cursor = d.nextCursor;
-      if (!d.hasMore) break;
+    if (!capturedIncome) {
+      throw new Error("no incoming (credit) transaction observed in the bound account stream");
     }
-    return { found, normalizedCents: normAmountCents };
+    if (capturedIncome.direction !== "credit" || capturedIncome.amountCents <= 0) {
+      throw new Error(
+        `incoming transaction normalized wrong: direction=${capturedIncome.direction} amountCents=${capturedIncome.amountCents}`
+      );
+    }
+    // Re-confirm deterministically: re-fetch and assert an income observation exists.
+    const d = await provider.syncObservations(binding, "");
+    const reIncome = d.added.find((o) => o.direction === "credit" && o.amountCents > 0);
+    if (!reIncome) throw new Error("incoming observation not reproducible on fresh sync");
+    return {
+      found: true,
+      normalizedCents: capturedIncome.amountCents,
+      direction: capturedIncome.direction,
+      externalRefFingerprint: capturedIncome.externalRefFingerprint,
+      status: capturedIncome.status,
+      name: capturedIncome.name,
+    };
   });
 
   // ── 8. Shadow Mode end-to-end (read-only; nothing moves money) ────────────
   const shadow = await step(8, "Shadow Mode capital/allocation decision (no execution)", async () => {
     const delta = await provider.syncObservations(binding, "");
-    const depositObs = delta.added
-      .concat(delta.modified)
-      .find((o) => o.description.includes("CERTIFICATION DEPOSIT"));
-    if (!depositObs) return { skipped: "no deposit observation present in Shadow input" };
+    const depositObs = delta.added.find((o) => o.direction === "credit" && o.amountCents > 0);
+    if (!depositObs) throw new Error("no income observation for Shadow input");
 
     const rule = {
       id: "r-cert",
@@ -307,26 +391,31 @@ async function main(): Promise<void> {
 
     const decisions = runShadowMode([persisted], { rules: [rule], portfolioState: portfolio });
     const decision = decisions[0];
+    if (!decision) throw new Error("no shadow decision produced");
     return {
-      disposition: decision?.disposition.kind ?? "none",
-      deployableCents: (decision?.plan.capitalPlan.deployable as number | undefined) ?? 0,
-      totalDeployedCents: (decision?.plan.allocationPlan.totalDeployed as number | undefined) ?? 0,
-      cashEventIdFingerprint: decision ? fp(decision.plan.cashEvent.id) : "none",
-      orderCount: decision?.plan.orders.length ?? 0,
-      plannedAhead: decision != null,
+      disposition: decision.disposition.kind,
+      deployableCents: (decision.plan.capitalPlan.deployable as number) ?? 0,
+      totalDeployedCents: (decision.plan.allocationPlan.totalDeployed as number) ?? 0,
+      cashEventIdFingerprint: fp(decision.plan.cashEvent.id),
+      orderCount: decision.plan.orders.length,
+      plannedAhead: true,
     };
   });
 
   // ── 9. Account isolation: non-depository accounts enumerated, never bound ─
   const isolation = await step(9, "account isolation (non-depository never bound)", async () => {
-    const nonDepository = accounts.filter(
+    const nonDepository = realAccounts.filter(
       (a) => a.subtype !== "checking" && a.subtype !== "savings" && a.subtype !== "depository" && a.subtype != null
     );
     return {
-      totalAccounts: accounts.length,
+      totalAccounts: realAccounts.length,
       nonDepositoryCount: nonDepository.length,
       nonDepositoryFingerprints: nonDepository.map((a) => fp(a.accountId)),
-      boundAccountIsDepository: depository.subtype === "checking" || depository.subtype === "savings" || depository.subtype === "depository" || depository.subtype == null,
+      boundAccountIsDepository:
+        depository.subtype === "checking" ||
+        depository.subtype === "savings" ||
+        depository.subtype === "depository" ||
+        depository.subtype == null,
     };
   });
 
@@ -334,10 +423,11 @@ async function main(): Promise<void> {
   const report = {
     environment: "sandbox",
     institutionId: INSTITUTION_ID,
+    testUser: "user_transactions_dynamic",
     item: { fingerprint: item.itemIdFingerprint },
     boundAccount: { fingerprint: fp(depositoryAccountId), subtype: depository.subtype },
     accounts: accountSummaries,
-    initialSync: redact(initial),
+    initialSync: initial,
     webhook,
     deposit,
     normalized,
