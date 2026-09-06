@@ -39,7 +39,7 @@ construction (orders are always `buy`, never `sell`).
 | `@alepes/persistence` | PostgreSQL persistence (plan + orders + append-only audit + transactional outbox). |
 | `@alepes/reconciliation` | Provider-neutral sync orchestration + Shadow Mode composition (sync → reconcile → interpret → qualify → shadow disposition). |
 | `@alepes/temporal-workflows` | Temporal orchestration layer (ExecutionPlanWorkflow + OutboxPublisherWorkflow). |
-| `@alepes/analytics` | Read-only analytics (DuckDB native API, confined by lint rule; never moves money). |
+| `@alepes/analytics` | Read-only analytics over PostgreSQL (provider-neutral `AnalyticsEngine`; never moves money). |
 
 ## Boundary discipline
 
@@ -87,7 +87,7 @@ Additional suites:
 Alepes has exactly one platform/toolchain and one narrow runtime island:
 
 - **Bun 1.4** (pinned via `packageManager`) is the Alepes platform: dependency
-  installation, scripts/tooling, the Next.js web/API, DuckDB analytics, Oxlint,
+  installation, scripts/tooling, the Next.js web/API, analytics, Oxlint,
   and ordinary tests.
 - **Node 24** (pinned via `.node-version`) is a narrow runtime dependency
   required **only** by the Temporal Worker and the Temporal workflow-isolate

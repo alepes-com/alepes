@@ -58,7 +58,6 @@ export default defineConfig({
     "alepes/no-direct-broker-execution": "warn",
     "alepes/require-execution-policy": "warn",
     "alepes/no-nondeterminism-in-workflow": "warn",
-    "alepes/no-duckdb-outside-analytics": "warn",
     "alepes/no-plaid-outside-adapter": "warn",
   },
   overrides: [
@@ -98,7 +97,6 @@ export default defineConfig({
         "alepes/no-direct-broker-execution": "error",
         "alepes/require-execution-policy": "warn",
         "alepes/no-nondeterminism-in-workflow": "error",
-        "alepes/no-duckdb-outside-analytics": "error",
         "alepes/no-plaid-outside-adapter": "error",
       },
     },
@@ -136,7 +134,6 @@ export default defineConfig({
         "alepes/no-direct-broker-execution": "warn",
         "alepes/require-execution-policy": "warn",
         "alepes/no-nondeterminism-in-workflow": "warn",
-        "alepes/no-duckdb-outside-analytics": "warn",
         "alepes/no-plaid-outside-adapter": "warn",
       },
     },

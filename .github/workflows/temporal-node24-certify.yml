@@ -11,8 +11,10 @@
 #   - duplicate outbox redelivery -> one logical workflow
 #
 # A green row here certifies the Node 24 runtime for Temporal; it does NOT
-# change Bun's role for installation, the web/API, analytics+DuckDB, Oxlint,
-# or ordinary tests.
+# change Bun's role — Bun 1.4 remains the main Alepes toolchain/runtime for
+# installation, the web/API, analytics (Postgres is the initial analytics
+# query engine, DuckDB deferred), Oxlint, and ordinary tests. Node 24 remains
+# the Temporal Worker / workflow-isolate runtime island only.
 
 name: temporal-node24-certify
 
