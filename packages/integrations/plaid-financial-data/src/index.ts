@@ -264,3 +264,22 @@ export {
   outgoingPlaidTransaction,
   plaidAccountWithBalances,
 } from "./fixtures";
+
+// Real account discovery + provider-neutral webhook handling (read-only sync).
+export {
+  discoverPlaidAccounts,
+  selectDepositoryAccount,
+  toDiscoverShape,
+} from "./discover";
+export type {
+  PlaidAccountsGetClient,
+  DiscoveredPlaidAccount,
+} from "./discover";
+export {
+  SYNC_UPDATES_AVAILABLE,
+  parseSyncUpdatesAvailable,
+} from "./webhook";
+export type {
+  SyncWebhookPayload,
+  SyncUpdatesRequest,
+} from "./webhook";
