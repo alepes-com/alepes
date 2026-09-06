@@ -413,14 +413,15 @@ a short-lived branch (e.g. `feat/plaid-readonly`), not directly on `main`.
 ### Runtime/toolchain policy
 
 - **Bun 1.4** is the repository toolchain and default runtime: dependency
-  installation, ordinary scripts, web/API, DuckDB analytics, Oxlint, and normal
+  installation, ordinary scripts, web/API, analytics, Oxlint, and normal
   repo validation.
 - **Node 24** is a narrow runtime exception for the Temporal Worker and
   workflow-isolate tests only.
 - Do not introduce npm or pnpm as alternate package-management workflows;
   `packageManager` remains Bun 1.4.
-- Native DuckDB remains confined to the analytics package.
-- PostgreSQL remains the transactional authority.
+- Analytical SQL runs over PostgreSQL (the transactional authority); no separate
+  analytical storage engine (e.g. DuckDB) is introduced in the runtime unless a
+  workload explicitly earns it.
 
 ### Validation before PR/merge
 
@@ -428,8 +429,7 @@ Before a PR is considered mergeable, run the validation appropriate to the chang
 area. The full repository validation floor is: pinned Bun version; TypeScript
 clean; Oxlint 0 errors; unit/property/conformance tests; PostgreSQL integration
 tests when persistence is affected; Node 24 Temporal workflow-isolate tests when
-Temporal is affected; DuckDB certification/analytics tests when analytics runtime
-behavior is affected; Next build; and `git diff --check`. CI must enforce the
+Temporal is affected; Next build; and `git diff --check`. CI must enforce the
 corresponding checks before merge to `main`.
 
 ### Agent behavior

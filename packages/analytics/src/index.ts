@@ -1,2 +1,2 @@
 export * from "./engine";
-export * from "./duckdb-engine";
+export * from "./postgres-engine";
