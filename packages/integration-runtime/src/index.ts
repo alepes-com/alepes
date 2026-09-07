@@ -8,6 +8,8 @@
 
 import type {
   AuditRecord,
+  BrokerageAccountState,
+  BrokeragePosition,
   CashEvent,
   ExecutionOrder,
   ExternalObservationRef,
@@ -153,6 +155,60 @@ export interface FinancialDataProvider {
 /** The canonical capability id for the read-only financial-data provider. */
 export type FinancialDataProviderCapability = Capability & FinancialDataProvider;
 
+// ─── Brokerage-data-provider (brokerage read-only) ───────────────────────────
+//
+// The read-only brokerage observation contract. Unlike the thin `ReadPortfolio`
+// / `ReadPrices` capabilities (which the mock/legacy path uses), this exposes
+// ACCOUNT-LEVEL facts — cash, buying power, status — plus positions and prices,
+// so Shadow Mode can operate against real account structure without submitting
+// trades. It is provider-neutral: no Alpaca (or any vendor) terminology, field,
+// endpoint, or SDK abstraction appears here.
+//
+// READ-ONLY: there is deliberately NO order, transfer, or mutation method, and
+// the runtime's `capability:brokerage:submit-orders` is NOT part of this surface.
+//
+
+/** A read-only provider-neutral brokerage position list + account state. */
+export interface BrokerageSnapshot {
+  account: BrokerageAccountState;
+  positions: BrokeragePosition[];
+}
+
+/**
+ * The read-only brokerage-data-provider capability. Implementations adapt a
+ * specific brokerage (e.g. Alpaca paper) to this contract; they must NOT expose
+ * credentials, provider types, or financial-policy decisions, and must NOT
+ * provide any order-submission surface.
+ */
+export interface BrokerageDataProvider {
+  readonly info: ProviderInfo;
+
+  /**
+   * Discover the brokerage accounts available under a credential reference.
+   * Returns zero or more opaque account bindings — never raw credential material.
+   */
+  discoverAccounts(credentialRef: string): Promise<AccountBinding[]>;
+
+  /**
+   * Read the account-level facts (cash, buying power, status, market value) for
+   * a bound account. Facts only; no policy.
+   */
+  readAccount(binding: AccountBinding): Promise<BrokerageAccountState>;
+
+  /**
+   * Read the current positions for a bound account. Quantities and monetary
+   * values are normalized to exact decimal strings / integer cents — never
+   * JS-float authoritative money.
+   */
+  readPositions(binding: AccountBinding): Promise<BrokeragePosition[]>;
+
+  /** Read the current price per share (in cents) for the requested symbols. */
+  readPrices(binding: AccountBinding, symbols: string[]): Promise<Record<string, Cents>>;
+}
+
+/** The canonical capability id for the read-only brokerage-data provider. */
+export type BrokerageDataProviderCapability = Capability & BrokerageDataProvider;
+
 /** The canonical capability ids. */
 export const CAPABILITIES = {
   readCheckingBalance: "capability:bank:read-checking-balance",
@@ -161,6 +217,7 @@ export const CAPABILITIES = {
   readPrices: "capability:brokerage:read-prices",
   submitOrders: "capability:brokerage:submit-orders",
   financialDataProvider: "capability:provider:financial-data",
+  brokerageDataProvider: "capability:provider:brokerage-data",
 } as const;
 
 /**

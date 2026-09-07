@@ -257,6 +257,48 @@ export interface PortfolioState {
   prices?: Record<string, Cents>;
 }
 
+// ─── Brokerage read-only observation ─────────────────────────────────────────
+//
+// A brokerage account's read-only state, observed by a read-only brokerage
+// adapter (e.g. Alpaca paper). These are FACTS — cash, buying power, account
+// status, positions — never policy. There is deliberately no order/execution
+// concept here: the read-only milestone forbids submitting trades, and the
+// runtime's `capability:brokerage:submit-orders` is NOT part of this surface.
+
+/** A provider-neutral brokerage account snapshot at a point in time. */
+export interface BrokerageAccountState {
+  /** Alepes-owned binding id the account belongs to (minted at binding time). */
+  accountBindingId: string;
+  /** Opaque provider account reference; only the adapter interprets it. */
+  providerAccountRef: ExternalObservationRef;
+  /** Account status as the provider reports it (facts, not policy). */
+  status: "active" | "restricted" | "closed";
+  /** Cash balance available to trade, integer cents (non-negative). */
+  cashCents: NonNegativeCents;
+  /** Buying power (cash × margin multiplier), integer cents (non-negative). */
+  buyingPowerCents: NonNegativeCents;
+  /** Long market value (equity held), integer cents (non-negative). */
+  portfolioValueCents: NonNegativeCents;
+  /** ISO-8601 timestamp the provider captured this account state. */
+  capturedAt: string;
+  /** The normalization version that produced this snapshot. */
+  normalizationVersion: string;
+}
+
+/** One read-only brokerage position: quantity + market value + cost basis. */
+export interface BrokeragePosition {
+  /** Normalized symbol (uppercase, provider-symbol-free). */
+  symbol: string;
+  /** Quantity held, as an exact decimal string (avoids JS-float drift). */
+  quantity: string;
+  /** Current market value in integer cents (non-negative). */
+  marketValueCents: NonNegativeCents;
+  /** Average entry price in cents-per-share (non-negative). */
+  averageEntryPriceCents: NonNegativeCents;
+  /** The provider-reported currency the position is denominated in. */
+  currency: string;
+}
+
 /** A raw cash movement observed by a bank integration. */
 export interface CashEvent {
   id: string;

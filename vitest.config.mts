@@ -41,6 +41,10 @@ alias["@alepes/plaid-financial-data"] = path.resolve(
   dirname,
   "./packages/integrations/plaid-financial-data/src/index.ts"
 );
+alias["@alepes/alpaca-brokerage-data"] = path.resolve(
+  dirname,
+  "./packages/integrations/alpaca-brokerage-data/src/index.ts"
+);
 
 export default defineConfig({
   plugins: [react()],
