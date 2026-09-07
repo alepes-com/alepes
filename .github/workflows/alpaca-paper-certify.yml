@@ -1,0 +1,56 @@
+# Alpaca paper certification — first-hand read-only evidence for v0.3.0.
+#
+# This is a TRUSTED, environment-gated workflow. It talks to the REAL Alpaca
+# paper API (never live trading) using credentials stored as GitHub *Environment*
+# secrets — not repo secrets, so only jobs that explicitly declare this
+# environment can read them.
+#
+# SECURITY (hard rules):
+#   - Runs only under `environment: alpaca-paper`, a GitHub Environment that MUST
+#     be restricted (branch rules / required reviewers) to trusted refs.
+#   - The harness refuses any env other than "paper"/"sandbox" and never contacts
+#     Alpaca live trading (api.alpaca.markets).
+#   - The harness redacts the key id, secret, and account ids from ALL output —
+#     it never prints raw or transformed secrets. Do not add `echo`/`printenv`
+#     of these values anywhere in this file.
+#   - This is READ-ONLY evidence: it reads /v2/account, /v2/positions, and
+#     market-data quotes only. There is no order/transfer/mutation surface.
+
+name: alpaca-paper-certify
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "packages/integrations/alpaca-brokerage-data/**"
+      - "packages/integration-runtime/**"
+      - "packages/domain/**"
+      - ".github/workflows/alpaca-paper-certify.yml"
+
+concurrency:
+  group: alpaca-paper-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  certify-paper:
+    name: alpaca paper (read-only) certification
+    runs-on: ubuntu-24.04
+    # Trusted-environment gate: secrets are exposed ONLY here, and only when the
+    # Environment's branch/reviewer restrictions permit this ref.
+    environment: alpaca-paper
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Install dependencies (Bun 1.4)
+        run: bun install --frozen-lockfile
+
+      - name: Run Alpaca paper certification (read-only, redacted)
+        env:
+          ALEPES_ALPACA_ENV: paper
+          ALEPES_ALPACA_PAPER_KEY: ${{ secrets.ALEPES_ALPACA_PAPER_KEY }}
+          ALEPES_ALPACA_PAPER_SECRET: ${{ secrets.ALEPES_ALPACA_PAPER_SECRET }}
+        run: bun run certify:alpaca-paper

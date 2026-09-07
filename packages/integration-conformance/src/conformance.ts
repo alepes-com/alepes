@@ -10,12 +10,13 @@ import type {
   FinancialObservation,
   PortfolioState,
 } from "@alepes/domain";
-import { nonNegativeCents } from "@alepes/money";
+import { nonNegativeCents, toNumber } from "@alepes/money";
 import {
   CAPABILITIES,
   ProviderError,
   Registry,
   type AccountBinding,
+  type BrokerageDataProvider,
   type FinancialDataProvider,
   type ListDeposits,
   type Plugin,
@@ -297,6 +298,104 @@ export async function certifyFinancialDataProvider(
       const d = await provider.syncObservations(b, cursor);
       if (/cred:test|secret|token|password/i.test(JSON.stringify(d))) {
         throw new Error("credential material leaked into delta");
+      }
+    });
+  }
+
+  return {
+    pluginId: provider.info.id,
+    failures,
+    get pass() {
+      return failures.length === 0;
+    },
+  };
+}
+
+/**
+ * Certify a read-only brokerage-data provider against the provider-neutral
+ * brokerage observation contract. Proves the invariants Shadow Mode depends on:
+ * account discovery returns opaque bindings (no credential material), account
+ * facts normalize to non-negative integer cents, positions normalize to exact
+ * decimal quantities + integer cents, prices are integer cents, and the provider
+ * exposes NO order-submission surface.
+ */
+export async function certifyBrokerageDataProvider(
+  provider: BrokerageDataProvider
+): Promise<ConformanceReport> {
+  const failures: string[] = [];
+
+  async function check(name: string, fn: () => Promise<void> | void) {
+    try {
+      await fn();
+    } catch (err) {
+      failures.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  let binding: AccountBinding | null = null;
+  try {
+    const accts = await provider.discoverAccounts("cred:paper");
+    if (!Array.isArray(accts) || accts.length === 0) {
+      failures.push("discoverAccounts: no accounts discovered");
+    } else {
+      binding = accts[0];
+    }
+  } catch (err) {
+    failures.push(`discoverAccounts: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (binding) {
+    const b = binding;
+
+    await check("binding carries NO raw credential material", () => {
+      if (/secret|password|api.?key|bearer|basic /i.test(JSON.stringify(b))) {
+        throw new Error("credential material leaked into binding");
+      }
+    });
+
+    await check("readAccount returns well-formed non-negative integer facts", async () => {
+      const a = await provider.readAccount(b);
+      if (!a || typeof a.cashCents !== "number" || typeof a.buyingPowerCents !== "number")
+        throw new Error("account missing monetary fields");
+      for (const [name, v] of [
+        ["cashCents", a.cashCents],
+        ["buyingPowerCents", a.buyingPowerCents],
+        ["portfolioValueCents", a.portfolioValueCents],
+      ] as const) {
+        if (!Number.isSafeInteger(toNumber(v)) || toNumber(v) < 0) {
+          throw new Error(`${name} is not a non-negative integer`);
+        }
+      }
+      if (!["active", "restricted", "closed"].includes(a.status)) {
+        throw new Error(`invalid status: ${a.status}`);
+      }
+    });
+
+    await check("readPositions returns exact quantities + integer cents", async () => {
+      const positions = await provider.readPositions(b);
+      if (!Array.isArray(positions)) throw new Error("positions is not an array");
+      for (const p of positions) {
+        if (typeof p.quantity !== "string" || !/^\d+(\.\d+)?$/.test(p.quantity)) {
+          throw new Error(`position quantity is not an exact decimal string: ${p.quantity}`);
+        }
+        if (!Number.isSafeInteger(toNumber(p.marketValueCents)) || !Number.isSafeInteger(toNumber(p.averageEntryPriceCents))) {
+          throw new Error("position monetary value is not integer cents");
+        }
+      }
+    });
+
+    await check("readPrices returns integer cents per symbol", async () => {
+      const prices = await provider.readPrices(b, ["AAPL"]);
+      if (typeof prices !== "object" || prices === null) throw new Error("expected a map");
+      if (!Number.isSafeInteger(toNumber(prices.AAPL))) throw new Error("price is not integer cents");
+    });
+
+    await check("provider exposes NO order-submission surface", () => {
+      const surf = provider as BrokerageDataProvider & Record<string, unknown>;
+      for (const key of Object.keys(surf)) {
+        if (/order|submit|trade|execut|transfer|place/i.test(key)) {
+          throw new Error(`mutative surface exposed: ${key}`);
+        }
       }
     });
   }
