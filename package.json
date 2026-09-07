@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:temporal": "vitest run packages/temporal-workflows/src/workflows.test.ts"
+    "test:temporal": "vitest run packages/temporal-workflows/src/workflows.test.ts",
+    "certify:plaid-sandbox": "bun packages/integrations/plaid-financial-data/certify-sandbox.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

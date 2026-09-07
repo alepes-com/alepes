@@ -82,6 +82,42 @@ Additional suites:
 - `packages/integration-conformance/src/conformance.ts` — reusable certification
   harness; certify any bank/brokerage plugin against its capability contract.
 
+## Plaid Sandbox certification (first-hand, live Sandbox only)
+
+The provider-neutral Plaid adapter (`packages/integrations/plaid-financial-data`)
+is covered by fixtures and mocks in the ordinary suite. A separate, standalone
+harness can prove the SAME adapter against real Plaid Sandbox responses — the
+evidence gate for the `v0.2.0` read-only milestone. It is deliberately NOT part
+of CI and NOT a Vitest suite, because it requires live Sandbox credentials.
+
+Run it with:
+
+```bash
+PLAID_ENV=sandbox \
+PLAID_CLIENT_ID=<sandbox client id> \
+PLAID_SECRET=<sandbox secret> \
+bun run certify:plaid-sandbox
+```
+
+The harness:
+
+- refuses to run unless `PLAID_ENV` is exactly `sandbox` (never Production);
+- creates a `user_transactions_dynamic` Sandbox Item (default `ins_109508`,
+  "First Platypus Bank" — override with `PLAID_SANDBOX_INSTITUTION_ID`);
+- binds the depository account and proves `/transactions/sync` is account-scoped
+  (`options.account_id`), pagination drains, and the cursor stays behind the
+  adapter boundary;
+- fires `SYNC_UPDATES_AVAILABLE` and proves the webhook → resync trigger is
+  idempotent;
+- creates a custom incoming deposit via `/sandbox/transactions/create` and
+  proves it normalizes to a provider-neutral credit and reaches Shadow Mode
+  (nothing ever moves money);
+- redacts client id, secret, access tokens, item ids, and account ids to
+  deterministic fingerprints in all output.
+
+Credentials never touch git, shell history, or the report: source them from an
+environment/secrets mechanism and keep them out of the repo.
+
 ## Runtime boundary
 
 Alepes has exactly one platform/toolchain and one narrow runtime island:
