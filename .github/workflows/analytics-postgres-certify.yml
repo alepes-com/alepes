@@ -1,0 +1,95 @@
+# Postgres analytics runtime certification.
+#
+# Alepes's analytics engine is PostgresAnalyticsEngine: a read-only adapter over
+# the canonical Postgres schema (execution_plan_events) written by
+# @alepes/persistence. DuckDB is deferred.
+#
+# This job proves the Postgres-backed analytics integration suite actually
+# EXECUTES (not merely env-skips) under the pinned Bun 1.4 toolchain against a
+# real PostgreSQL 16 service, applying the repository's canonical migrations via
+# the existing @alepes/persistence migration/test mechanism (no schema SQL is
+# duplicated here).
+#
+# This is a Bun-native certification island, parallel to (not folded into) the
+# Node 24 Temporal certification. Bun 1.4 certifies analytics; Node 24 certifies
+# the Temporal workflow isolate. Each runtime boundary certifies itself.
+#
+# A green row here means: connection/open/close, canonical migration
+# compatibility, empty state, stageSeries(), stageCentsReport(), canonical
+# lifecycle `kind` values, deterministic ordering, zero amounts, and
+# integer-cent preservation without float coercion — all against real Postgres.
+
+name: analytics-postgres-certify
+
+on:
+  push:
+    paths:
+      - "packages/analytics/**"
+      - "packages/persistence/**"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/analytics-postgres-certify.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: analytics-postgres-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  certify-analytics:
+    name: analytics (ubuntu, Bun 1.4 + Postgres 16)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: alepes
+          POSTGRES_PASSWORD: alepes
+          POSTGRES_DB: alepes
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U alepes"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bun 1.4 is the pinned toolchain AND the analytics runtime. Do not
+      # introduce Node here.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Record runtime version
+        run: |
+          echo "bun: $(bun --version)"
+
+      - name: Install dependencies (Bun 1.4)
+        run: bun install --frozen-lockfile
+
+      - name: Provision analytics PostgreSQL test database
+        run: |
+          export PGPASSWORD=alepes
+          psql -h localhost -U alepes -d alepes -c "SELECT 1" >/dev/null
+          psql -h localhost -U alepes -d alepes -tc \
+            "SELECT 1 FROM pg_database WHERE datname='alepes_analytics_test'" | grep -q 1 \
+            || psql -h localhost -U alepes -d alepes -c "CREATE DATABASE alepes_analytics_test"
+          echo "provisioned: alepes_analytics_test"
+
+      # The analytics integration suite applies the canonical migrations itself
+      # (via @alepes/persistence runMigrations) and proves the Postgres-backed
+      # queries. --passWithNoTests=false fails loudly if the env-gated suite
+      # skips instead of executing.
+      - name: Certify PostgresAnalyticsEngine (real PostgreSQL)
+        env:
+          ALEPES_TEST_ANALYTICS_DATABASE_URL: postgresql://alepes:alepes@localhost:5432/alepes_analytics_test
+        run: |
+          bunx vitest run packages/analytics --passWithNoTests=false 2>&1 | tail -60
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+      - name: Lint
+        run: bunx oxlint
