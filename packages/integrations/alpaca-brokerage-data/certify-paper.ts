@@ -228,6 +228,9 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  console.error("CERTIFICATION CRASHED:", e instanceof Error ? e.message : String(e));
+  // SAFETY: route the crash message through `redact` as well — an upstream error
+  // body could conceivably echo a credential or derived auth string; never print it raw.
+  const raw = e instanceof Error ? e.message : String(e);
+  console.error("CERTIFICATION CRASHED:", redact(raw));
   process.exit(1);
 });
