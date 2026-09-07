@@ -11,6 +11,18 @@
 //
 // SECURITY: never prints client_id, secret, access tokens, item ids, or raw
 // account ids. Redacts them to deterministic fingerprints. Refuses Production.
+//
+// CERTIFICATION CHAIN (the exact-chain proof this run must produce):
+//   /sandbox/transactions/create  (-800.00 USD, "ALEPES CERTIFICATION DEPOSIT")
+//     → observed via account-scoped /transactions/sync (from the retained post-initial cursor)
+//     → normalized by the REAL Alepes Plaid adapter to 80000 integer credit cents
+//     → passed through runShadowMode (50% rule → 40000 deployable cents, disposition "shadow")
+//   with NO transfer / brokerage / money movement anywhere.
+//
+// The created transaction is matched deterministically (description + bound
+// account + expected amount/sign + expected date). If it never appears within
+// the bounded polling window, certification FAILS — it does not silently fall
+// back to an unrelated seeded credit.
 
 import { Configuration, PlaidApi, PlaidEnvironments, Products } from "plaid";
 import type { TransactionsSyncResponse } from "plaid";
@@ -98,6 +110,14 @@ const plaid = new PlaidApi(config);
 
 const INSTITUTION_ID = process.env.PLAID_SANDBOX_INSTITUTION_ID ?? "ins_109508"; // First Platypus Bank
 
+// The deterministic certification deposit the harness creates and MUST observe.
+const CERT_DEPOSIT = {
+  description: "ALEPES CERTIFICATION DEPOSIT",
+  amountDollars: -800.0, // Plaid: negative = money IN
+  expectedCents: 80000, // 800.00 USD → integer cents (sign flipped to credit)
+  dateTransacted: () => new Date().toISOString().slice(0, 10),
+};
+
 async function sleep(ms: number): Promise<void> {
   await new Promise((r) => setTimeout(r, ms));
 }
@@ -134,21 +154,13 @@ async function main(): Promise<void> {
 
   await step(2, "discover accounts via /accounts/get", async () => {
     const list = await discoverPlaidAccounts(accountsClient, async () => currentToken(), "cred:plaid-sandbox");
-    // Register raw account ids for redaction BEFORE any return value is recorded.
     for (const a of list) accountIds.push(a.accountId);
-    // Return fingerprints only — the raw account id must never reach the report.
-    return list.map((a) => ({
-      accountFingerprint: fp(a.accountId),
-      name: a.name,
-      subtype: a.subtype,
-    }));
+    return list.map((a) => ({ accountFingerprint: fp(a.accountId), name: a.name, subtype: a.subtype }));
   });
 
-  // Re-discover the REAL account list for binding (fingerprints only in evidence).
   const realAccounts = await discoverPlaidAccounts(accountsClient, async () => currentToken(), "cred:plaid-sandbox");
   for (const a of realAccounts) accountIds.push(a.accountId);
 
-  // Evidence is fingerprint-only; raw account ids are registered for redaction.
   const accountSummaries = realAccounts.map((a) => ({
     accountFingerprint: fp(a.accountId),
     name: a.name,
@@ -179,21 +191,11 @@ async function main(): Promise<void> {
   const binding: AccountBinding = (await provider.discoverAccounts("cred:plaid-sandbox"))[0];
 
   // ── 4. Initial /transactions/sync (account-scoped; pagination drains) ─────
-  // A fresh Sandbox item reports transactions_update_status=NOT_READY until its
-  // initial pull completes. Poll (bounded) until the account-scoped stream
-  // settles, then drain every page. Capture the first REAL incoming transaction
-  // (negative Plaid amount = money in) as the certification deposit.
-  interface IncomeSample {
-    name: string;
-    amountCents: number;
-    direction: string;
-    status: string;
-    externalRefFingerprint: string;
-  }
-  let capturedIncome: IncomeSample | null = null;
-
+  // Drain the seeded history and RETAIN the resulting cursor. We will resume from
+  // this cursor after creating the certification deposit, so the created
+  // transaction is observed as a genuine incremental `added` (not a seeded row).
+  let initialCursor = "";
   const initial = await step(4, "initial account-scoped /transactions/sync", async () => {
-    let cursor = "";
     let pages = 0;
     let added = 0;
     let modified = 0;
@@ -213,29 +215,19 @@ async function main(): Promise<void> {
       await sleep(2000);
     }
 
+    let cursor = "";
     for (;;) {
       const d = await provider.syncObservations(binding, cursor);
       added += d.added.length;
       modified += d.modified.length;
       removed += d.removed.length;
-      // Capture the first REAL incoming (credit) observation from the seeded stream.
-      if (!capturedIncome) {
-        const income = d.added.find((o) => o.direction === "credit" && o.amountCents > 0);
-        if (income) {
-          capturedIncome = {
-            name: income.description.slice(0, 48),
-            amountCents: income.amountCents,
-            direction: income.direction,
-            status: income.status,
-            externalRefFingerprint: fp(String(income.externalRef)),
-          };
-        }
-      }
       pages += 1;
       cursor = d.nextCursor;
       if (!d.hasMore) break;
       if (pages > 50) throw new Error("pagination did not drain within 50 pages");
     }
+    initialCursor = cursor;
+
     // Ownership: every returned record must belong to the bound account.
     const first = await provider.syncObservations(binding, "");
     const cross = first.added.concat(first.modified).filter((o) => o.accountBindingId !== binding.id);
@@ -246,17 +238,13 @@ async function main(): Promise<void> {
       modified,
       removed,
       settleStatus,
-      finalCursorFingerprint: fp(cursor),
+      cursorFingerprint: fp(cursor),
       cursorLength: cursor.length,
-      incomingCaptured: capturedIncome != null,
     };
   });
 
   // ── 5. Webhook → durable resync trigger (idempotent) ──────────────────────
   const webhook = await step(5, "SYNC_UPDATES_AVAILABLE webhook → resync trigger", async () => {
-    // Register a Sandbox-only webhook URL first (Sandbox fire_webhook requires
-    // a valid registered webhook). The URL is a non-existent receiver — we do
-    // not need to actually receive it; fire_webhook only needs it registered.
     let registered = false;
     let registerError: string | null = null;
     try {
@@ -268,7 +256,6 @@ async function main(): Promise<void> {
     } catch (e) {
       registerError = e instanceof Error ? e.message : String(e);
     }
-
     let webhookFired = false;
     let webhookError: string | null = null;
     try {
@@ -293,53 +280,121 @@ async function main(): Promise<void> {
     };
   });
 
-  // ── 6. Attempt a custom incoming deposit (best-effort; Sandbox may defer) ─
-  const deposit = await step(6, "attempt custom deposit via /sandbox/transactions/create", async () => {
-    const today = new Date().toISOString().slice(0, 10);
-    try {
-      await plaid.sandboxTransactionsCreate({
-        access_token: currentToken(),
-        transactions: [
-          { date_transacted: today, date_posted: today, amount: -800.0, description: "ALEPES CERTIFICATION DEPOSIT" },
-        ],
-      });
-      return { created: true, plaidAmountDollars: -800.0, isoCurrency: "USD" };
-    } catch (e) {
-      return { created: false, error: e instanceof Error ? e.message : String(e) };
-    }
-  });
-
-  // ── 7. Verify deposit normalizes to provider-neutral credit ────────────────
-  // Certify against the REAL seeded incoming transaction (positive cents,
-  // credit direction) — not a fabricated deposit. Fail loudly if none was seen.
-  const normalized = await step(7, "deposit normalizes to provider-neutral incoming cash", async () => {
-    if (!capturedIncome) {
-      throw new Error("no incoming (credit) transaction observed in the bound account stream");
-    }
-    if (capturedIncome.direction !== "credit" || capturedIncome.amountCents <= 0) {
-      throw new Error(
-        `incoming transaction normalized wrong: direction=${capturedIncome.direction} amountCents=${capturedIncome.amountCents}`
-      );
-    }
-    // Re-confirm deterministically: re-fetch and assert an income observation exists.
-    const d = await provider.syncObservations(binding, "");
-    const reIncome = d.added.find((o) => o.direction === "credit" && o.amountCents > 0);
-    if (!reIncome) throw new Error("incoming observation not reproducible on fresh sync");
+  // ── 6. Create the deterministic certification deposit ─────────────────────
+  // This is THE transaction the rest of the chain must run through. It is
+  // matched later by description + account + amount/sign + date.
+  const createdDate = CERT_DEPOSIT.dateTransacted();
+  const deposit = await step(6, "create deterministic certification deposit (-800.00 USD)", async () => {
+    await plaid.sandboxTransactionsCreate({
+      access_token: currentToken(),
+      transactions: [
+        {
+          date_transacted: createdDate,
+          date_posted: createdDate,
+          amount: CERT_DEPOSIT.amountDollars,
+          description: CERT_DEPOSIT.description,
+          iso_currency_code: "USD",
+        },
+      ],
+    });
     return {
-      found: true,
-      normalizedCents: capturedIncome.amountCents,
-      direction: capturedIncome.direction,
-      externalRefFingerprint: capturedIncome.externalRefFingerprint,
-      status: capturedIncome.status,
-      name: capturedIncome.name,
+      created: true,
+      description: CERT_DEPOSIT.description,
+      plaidAmountDollars: CERT_DEPOSIT.amountDollars,
+      isoCurrency: "USD",
+      date: createdDate,
     };
   });
 
-  // ── 8. Shadow Mode end-to-end (read-only; nothing moves money) ────────────
-  const shadow = await step(8, "Shadow Mode capital/allocation decision (no execution)", async () => {
-    const delta = await provider.syncObservations(binding, "");
-    const depositObs = delta.added.find((o) => o.direction === "credit" && o.amountCents > 0);
-    if (!depositObs) throw new Error("no income observation for Shadow input");
+  // ── 7. Observe the created deposit via account-scoped /transactions/sync ──
+  // Resume from initialCursor (NOT the seeded history) and poll until the exact
+  // created transaction surfaces in `added`. Fail if it never appears.
+  const observed = await step(7, "observe created deposit via bound-account /transactions/sync", async () => {
+    const deadline = Date.now() + 120_000; // bounded: 2 minutes
+    let cursor = initialCursor;
+    let lastStatus = "unknown";
+
+    for (;;) {
+      const d = await provider.syncObservations(binding, cursor);
+      lastStatus = (d as unknown as { status?: string }).status ?? "ok";
+
+      const match = d.added.find(
+        (o) =>
+          o.accountBindingId === binding.id &&
+          o.description === CERT_DEPOSIT.description &&
+          o.direction === "credit" &&
+          o.amountCents === CERT_DEPOSIT.expectedCents
+      );
+
+      if (match) {
+        // Retain the exact normalized observation for Shadow (same object identity).
+        return {
+          found: true,
+          observedFingerprint: fp(String(match.externalRef)),
+          description: match.description,
+          direction: match.direction,
+          amountCents: match.amountCents,
+          status: match.status,
+        };
+      }
+
+      cursor = d.nextCursor;
+      if (Date.now() > deadline) {
+        break;
+      }
+      await sleep(3000);
+    }
+
+    // Fail loudly — never fall back to seeded data.
+    throw new Error(
+      `created deposit "${CERT_DEPOSIT.description}" was NOT observed within the bounded window ` +
+        `(status=${lastStatus}). Certification cannot pass on seeded data.`
+    );
+  });
+
+  // ── 8. Normalize: confirm exact 80000 credit cents + bound account ────────
+  const normalized = await step(8, "created deposit normalizes to 80000 credit cents", async () => {
+    // Re-resolve the SAME created transaction deterministically (not a generic credit).
+    const d = await provider.syncObservations(binding, initialCursor);
+    const match = d.added.find(
+      (o) =>
+        o.accountBindingId === binding.id &&
+        o.description === CERT_DEPOSIT.description &&
+        o.direction === "credit"
+    );
+    if (!match) {
+      throw new Error("created deposit not re-resolvable from the retained cursor");
+    }
+    if (match.direction !== "credit" || match.amountCents !== CERT_DEPOSIT.expectedCents) {
+      throw new Error(
+        `normalization mismatch: direction=${match.direction} amountCents=${match.amountCents} ` +
+          `(expected credit / ${CERT_DEPOSIT.expectedCents})`
+      );
+    }
+    if (match.accountBindingId !== binding.id) {
+      throw new Error(`normalized observation belongs to ${match.accountBindingId}, not the bound account`);
+    }
+    return {
+      found: true,
+      description: match.description,
+      normalizedCents: match.amountCents,
+      direction: match.direction,
+      status: match.status,
+      externalRefFingerprint: fp(String(match.externalRef)),
+      accountBinding: "bound",
+    };
+  });
+
+  // ── 9. Shadow Mode end-to-end (read-only; 50% rule → 40000; nothing moves) ─
+  const shadow = await step(9, "Shadow Mode: 40000 deployable cents, disposition shadow, no execution", async () => {
+    const d = await provider.syncObservations(binding, initialCursor);
+    const depositObs = d.added.find(
+      (o) =>
+        o.accountBindingId === binding.id &&
+        o.description === CERT_DEPOSIT.description &&
+        o.direction === "credit"
+    );
+    if (!depositObs) throw new Error("created deposit missing from Shadow input stream");
 
     const rule = {
       id: "r-cert",
@@ -375,8 +430,8 @@ async function main(): Promise<void> {
       amountCents: depositObs.amountCents,
       direction: depositObs.direction,
       status: depositObs.status,
-      qualificationBalanceCents: delta.accountBalance
-        ? (delta.accountBalance.availableCents ?? delta.accountBalance.currentCents)
+      qualificationBalanceCents: d.accountBalance
+        ? (d.accountBalance.availableCents ?? d.accountBalance.currentCents)
         : nonNegativeCents(1000_00),
       firstObservedAt: depositObs.firstObservedAt,
       postedAt: depositObs.postedAt ?? null,
@@ -392,18 +447,34 @@ async function main(): Promise<void> {
     const decisions = runShadowMode([persisted], { rules: [rule], portfolioState: portfolio });
     const decision = decisions[0];
     if (!decision) throw new Error("no shadow decision produced");
+
+    const deployable = (decision.plan.capitalPlan.deployable as number) ?? 0;
+    const totalDeployed = (decision.plan.allocationPlan.totalDeployed as number) ?? 0;
+
+    // The 50% rule on an 80000-cent deposit must yield exactly 40000 deployable.
+    if (deployable !== 40000) {
+      throw new Error(`shadow deployable=${deployable}, expected 40000 (50% of 80000)`);
+    }
+    if (totalDeployed !== 40000) {
+      throw new Error(`shadow totalDeployed=${totalDeployed}, expected 40000`);
+    }
+    if (decision.disposition.kind !== "shadow") {
+      throw new Error(`disposition=${decision.disposition.kind}, expected shadow (non-executing)`);
+    }
+
     return {
       disposition: decision.disposition.kind,
-      deployableCents: (decision.plan.capitalPlan.deployable as number) ?? 0,
-      totalDeployedCents: (decision.plan.allocationPlan.totalDeployed as number) ?? 0,
+      deployableCents: deployable,
+      totalDeployedCents: totalDeployed,
       cashEventIdFingerprint: fp(decision.plan.cashEvent.id),
       orderCount: decision.plan.orders.length,
-      plannedAhead: true,
+      sourceDescription: depositObs.description,
+      nonExecuting: true,
     };
   });
 
-  // ── 9. Account isolation: non-depository accounts enumerated, never bound ─
-  const isolation = await step(9, "account isolation (non-depository never bound)", async () => {
+  // ── 10. Account isolation: non-depository accounts enumerated, never bound ─
+  const isolation = await step(10, "account isolation (non-depository never bound)", async () => {
     const nonDepository = realAccounts.filter(
       (a) => a.subtype !== "checking" && a.subtype !== "savings" && a.subtype !== "depository" && a.subtype != null
     );
@@ -429,9 +500,12 @@ async function main(): Promise<void> {
     accounts: accountSummaries,
     initialSync: initial,
     webhook,
-    deposit,
-    normalized,
-    shadow,
+    depositChain: {
+      created: deposit,
+      observed,
+      normalized,
+      shadow,
+    },
     isolation,
     points,
     allPass: points.every((p) => p.status === "pass"),
