@@ -362,6 +362,26 @@ create branch → commit → push branch → PR → CI → merge
 - Use Conventional Commit-style subjects where practical: `feat:`, `fix:`,
   `refactor:`, `chore:`, `test:`, `docs:`.
 
+### Solo-maintainer exception to review
+
+Alepes currently has a single maintainer with merge authority. Requiring a
+different-account approval in that state would add ceremony without increasing
+review quality, so the review step is relaxed **only** while a solo maintainer
+remains the sole authority. The author may merge a PR without an external
+approver, provided **every** one of the following holds:
+
+- all required CI checks pass on the exact head,
+- the full validation ladder passes,
+- any milestone-specific first-hand certification passes (e.g. credentialed
+  Plaid Sandbox for provider milestones),
+- a substantive self-review is completed and its material findings are
+  recorded on the PR,
+- no unresolved blocking review threads remain,
+- the PR is merged with a **normal merge commit** (never squash, never rebase).
+
+The moment a second maintainer with merge authority is available, external
+review becomes required again, and this exception ceases to apply.
+
 ### Semantic versioning
 
 Alepes uses Semantic Versioning with a `v`-prefixed Git tag. While pre-1.0, use
