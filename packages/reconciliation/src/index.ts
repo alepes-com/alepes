@@ -13,3 +13,8 @@ export type {
   ShadowProvenance,
   ShadowModeInput,
 } from "./shadow";
+export {
+  brokeragePortfolio,
+  brokerageToPortfolioState,
+  toPositionSnapshots,
+} from "./brokerage-shadow";

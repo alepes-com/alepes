@@ -83,4 +83,19 @@ describe("AlpacaBrokerageDataProvider", () => {
     );
     expect((p as never as { submitOrders?: unknown }).submitOrders).toBeUndefined();
   });
+
+  it("live environment: distinct provider id + live metadata, still read-only", async () => {
+    const client = makeStaticAlpacaClient();
+    const resolveCredentialRef = async () => "cred:live";
+    const p = createAlpacaBrokerageDataProvider({
+      client,
+      resolveCredentialRef,
+      environment: "live",
+    });
+    expect(p.info.id).toBe("alpaca-brokerage-data-live");
+    const accts = await p.discoverAccounts("cred:live");
+    expect(accts[0].metadata.environment).toBe("live");
+    // The live provider is read-only too — no mutative surface.
+    expect((p as never as { submitOrders?: unknown }).submitOrders).toBeUndefined();
+  });
 });

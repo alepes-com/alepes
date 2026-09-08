@@ -13,7 +13,8 @@
     "test:watch": "vitest",
     "test:temporal": "vitest run packages/temporal-workflows/src/workflows.test.ts",
     "certify:plaid-sandbox": "bun packages/integrations/plaid-financial-data/certify-sandbox.ts",
-    "certify:alpaca-paper": "bun packages/integrations/alpaca-brokerage-data/certify-paper.ts"
+    "certify:alpaca-paper": "bun packages/integrations/alpaca-brokerage-data/certify-paper.ts",
+    "certify:alpaca-live": "bun packages/integrations/alpaca-brokerage-data/certify-live.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
