@@ -44,6 +44,14 @@ export const ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets";
 export const ALPACA_SANDBOX_BASE_URL = "https://api.sandbox.alpaca.markets";
 export const ALPACA_MARKET_DATA_PAPER_URL = "https://data.sandbox.alpaca.markets";
 
+// ─── Live-boundary constants (v0.4.0) ──────────────────────────────────────
+// The LIVE Trading API host is deliberately a SEPARATE constant from paper, and
+// is reachable only through `createAlpacaLiveClient` below — never through
+// `createAlpacaClient`, whose defaults are paper-only. This keeps the paper
+// harness hard-guarded to paper even as the live path is added.
+export const ALPACA_LIVE_BASE_URL = "https://api.alpaca.markets";
+export const ALPACA_MARKET_DATA_LIVE_URL = "https://data.alpaca.markets";
+
 // ─── Injectably-testable HTTP boundary ───────────────────────────────────────
 // The adapter depends on a minimal client shape, not a concrete HTTP library.
 // Production code constructs a fetch-backed client (see `createAlpacaClient`);
@@ -113,6 +121,25 @@ export function createAlpacaClient(
         `${marketDataBaseUrl}/v2/stocks/${encodeURIComponent(symbol)}/quotes/latest`
       ),
   };
+}
+
+/**
+ * The LIVE-TRADING read-only client (v0.4.0). This is the ONLY entry point that
+ * targets `api.alpaca.markets`. It is read-only by construction — the same
+ * AlpacaClient surface exposes only GET endpoints (account/positions/quotes),
+ * with NO order/transfer method. Live credentials never appear in logs (the
+ * auth header is built here and never echoed).
+ */
+export function createAlpacaLiveClient(
+  keyId: string,
+  secretKey: string
+): AlpacaClient {
+  return createAlpacaClient(
+    keyId,
+    secretKey,
+    ALPACA_LIVE_BASE_URL,
+    ALPACA_MARKET_DATA_LIVE_URL
+  );
 }
 
 // ─── Normalization (Alpaca → Alepes) ─────────────────────────────────────────
@@ -187,6 +214,13 @@ function throwForStatus(status: number): void {
 export interface AlpacaBrokerageDataProviderOptions {
   client: AlpacaClient;
   /**
+   * Which Alpaca host this provider reads from. `paper`/`sandbox` are the v0.3.0
+   * read-only observation boundary; `live` is the v0.4.0 real-account boundary.
+   * The provider reports this in its info + binding metadata so the certification
+   * harness can assert it is talking to the intended host.
+   */
+  environment?: "paper" | "sandbox" | "live";
+  /**
    * Resolve credential material (key/secret) to a durable credentialRef. The
    * adapter never holds raw keys; it only carries opaque references, mirroring
    * the Plaid adapter's `resolveAccessToken`.
@@ -197,8 +231,11 @@ export interface AlpacaBrokerageDataProviderOptions {
 export function createAlpacaBrokerageDataProvider(
   opts: AlpacaBrokerageDataProviderOptions
 ): BrokerageDataProvider {
-  const { client } = opts;
-  const info: ProviderInfo = { id: "alpaca-brokerage-data", version: ALPACA_NORMALIZATION_VERSION };
+  const { client, environment = "paper" } = opts;
+  const info: ProviderInfo = {
+    id: `alpaca-brokerage-data-${environment}`,
+    version: ALPACA_NORMALIZATION_VERSION,
+  };
 
   return {
     info,
@@ -216,7 +253,7 @@ export function createAlpacaBrokerageDataProvider(
             providerAccountRef,
             credentialRef,
             name: `Alpaca ${data.account_number ?? data.id}`,
-            metadata: { subtype: "brokerage", environment: "paper" },
+            metadata: { subtype: "brokerage", environment },
           },
         ];
       } catch (err) {
