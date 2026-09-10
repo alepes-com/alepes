@@ -13,6 +13,7 @@ const packages = [
   "allocation-engine",
   "rules-engine",
   "execution-policy",
+  "certification-guards",
   "integration-runtime",
   "persistence",
   "reconciliation",

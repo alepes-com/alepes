@@ -25,6 +25,7 @@
       "@alepes/allocation-engine": ["./packages/allocation-engine/src/index.ts"],
       "@alepes/rules-engine": ["./packages/rules-engine/src/index.ts"],
       "@alepes/execution-policy": ["./packages/execution-policy/src/index.ts"],
+      "@alepes/certification-guards": ["./packages/certification-guards/src/index.ts"],
       "@alepes/integration-runtime": ["./packages/integration-runtime/src/index.ts"],
       "@alepes/persistence": ["./packages/persistence/src/index.ts"],
       "@alepes/reconciliation": ["./packages/reconciliation/src/index.ts"],
