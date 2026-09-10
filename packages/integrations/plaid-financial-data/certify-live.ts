@@ -7,10 +7,19 @@
 //   PLAID_ENV=production \
 //   PLAID_CLIENT_ID=<live client id> \
 //   PLAID_SECRET=<live secret> \
+//   PLAID_LIVE_POSTGRES_URL=<postgres connection string> \
 //   bun run certify:plaid-live
 //
 // SECURITY: never prints client_id, secret, access tokens, item ids, or raw
 // account ids. Redacts them to deterministic fingerprints. Refuses sandbox.
+//
+// REQUIRED ENVIRONMENT (GitHub Environment: plaid-live):
+//   Secrets (must be set in environment):
+//     PLAID_CLIENT_ID
+//     PLAID_SECRET
+//     PLAID_LIVE_POSTGRES_URL
+//   Environment variable (not secret, but required):
+//     PLAID_ENV=production   ← uses Plaid SDK's production boundary
 //
 // CERTIFICATION CHAIN (the exact-chain proof this run must produce):
 //   Real posted deposit observed via account-scoped /transactions/sync
