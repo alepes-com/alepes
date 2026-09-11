@@ -10,3 +10,13 @@ export {
   calculationVersion,
 } from "./identity";
 export { runMigrations } from "./migrations";
+export type {
+  CreateCertificationRunInput,
+  CompleteCertificationRunInput,
+  PersistedCertificationRun,
+  AuditEventStore,
+  CertificationRunStore,
+  ProviderCallEvidenceStore,
+  AuditPorts,
+} from "./audit-ports";
+export { createAuditPostgresStore } from "./audit-postgres";
