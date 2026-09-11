@@ -19,6 +19,8 @@
     "plaid": "47.0.0",
     "@alepes/money": "*",
     "@alepes/domain": "*",
-    "@alepes/integration-runtime": "*"
+    "@alepes/integration-runtime": "*",
+    "@alepes/audit": "*",
+    "@alepes/persistence": "*"
   }
 }
