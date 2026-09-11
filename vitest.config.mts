@@ -18,6 +18,8 @@ const packages = [
   "persistence",
   "reconciliation",
   "temporal-workflows",
+  "audit",
+  "reporting",
 ];
 const alias: Record<string, string> = {
   "@": path.resolve(dirname, "./src"),
