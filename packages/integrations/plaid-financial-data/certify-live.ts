@@ -8,16 +8,26 @@
 //   PLAID_CLIENT_ID=<live client id> \
 //   PLAID_SECRET=<live secret> \
 //   PLAID_LIVE_POSTGRES_URL=<postgres connection string> \
+//   PLAID_ACCESS_TOKEN=<production Item access token> \
 //   bun run certify:plaid-live
 //
 // SECURITY: never prints client_id, secret, access tokens, item ids, or raw
 // account ids. Redacts them to deterministic fingerprints. Refuses sandbox.
+//
+// The access token MUST originate from a real Production Item created through
+// Plaid Link with the `transactions` product enabled (public_token exchanged
+// server-side). This harness does NOT create Items and has no sandbox-style
+// `/sandbox/public_token/create` behavior — it only consumes a token supplied
+// through the secret boundary. The token lives in the `plaid-live` GitHub
+// Environment secret (and locally in ~/.config/alepes/plaid-production.env),
+// never in source, logs, PR text, fixtures, or artifacts.
 //
 // REQUIRED ENVIRONMENT (GitHub Environment: plaid-live):
 //   Secrets (must be set in environment):
 //     PLAID_CLIENT_ID
 //     PLAID_SECRET
 //     PLAID_LIVE_POSTGRES_URL
+//     PLAID_ACCESS_TOKEN                 ← Production Item access token (Plaid Link + Transactions)
 //   Environment variable (not secret, but required):
 //     PLAID_ENV=production   ← uses Plaid SDK's production boundary
 //
@@ -64,6 +74,7 @@ if (ENV !== "production") {
 const CLIENT_ID = process.env.PLAID_CLIENT_ID;
 const SECRET = process.env.PLAID_SECRET;
 const POSTGRES_URL = process.env.PLAID_LIVE_POSTGRES_URL;
+const ACCESS_TOKEN = process.env.PLAID_ACCESS_TOKEN;
 if (!CLIENT_ID || !SECRET) {
   console.error("REFUSING TO RUN: PLAID_CLIENT_ID and PLAID_SECRET must both be set (production).");
   process.exit(2);
@@ -72,9 +83,18 @@ if (!POSTGRES_URL) {
   console.error("REFUSING TO RUN: PLAID_LIVE_POSTGRES_URL must be set for persistence.");
   process.exit(2);
 }
+if (!ACCESS_TOKEN) {
+  console.error(
+    "REFUSING TO RUN: PLAID_ACCESS_TOKEN must be set (production). " +
+      "It must be a real Production Item access token created through Plaid Link " +
+      "with the `transactions` product enabled. This harness does not create Items."
+  );
+  process.exit(2);
+}
 const clientId: string = CLIENT_ID!;
 const secret: string = SECRET!;
 const pgUrl: string = POSTGRES_URL!;
+const accessToken: string = ACCESS_TOKEN!;
 
 // ─── Redaction helpers ────────────────────────────────────────────────────────
 
@@ -89,8 +109,20 @@ const accessTokens: string[] = [];
 const itemIds: string[] = [];
 const accountIds: string[] = [];
 
+// Register the supplied access token for redaction before any output is produced.
+// ACCESS_TOKEN was verified present above; this keeps it out of every log/artifact.
+accessTokens.push(accessToken);
+
 function redact(s: unknown): unknown {
-  if (typeof s !== "string") return s;
+  if (typeof s !== "string") {
+    if (Array.isArray(s)) return s.map(redact);
+    if (typeof s === "object" && s !== null) {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(s)) out[k] = redact(v);
+      return out;
+    }
+    return s;
+  }
   let out = s;
   out = out.replaceAll(CLIENT_ID!, "REDACTED_CLIENT_ID");
   out = out.replaceAll(SECRET!, "REDACTED_SECRET");
@@ -362,7 +394,7 @@ async function main(): Promise<void> {
   await store.close();
 
   // ── Report ─────────────────────────────────────────────────────────────────
-  const report = {
+  const rawReport = {
     environment: "production",
     testUser: "live",
     boundAccount: { fingerprint: fp(depositoryAccountId), subtype: depository.subtype },
@@ -376,6 +408,7 @@ async function main(): Promise<void> {
     allPass: points.every((p) => p.status === "pass"),
     note: "No brokerage, no money movement occurred. Shadow disposition only.",
   };
+  const report = redact(rawReport) as { allPass: boolean };
 
   console.log("\n=== PLAID LIVE CERTIFICATION REPORT ===");
   console.log(JSON.stringify(report, null, 2));
