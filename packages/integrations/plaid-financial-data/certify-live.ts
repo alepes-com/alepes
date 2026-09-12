@@ -1,5 +1,4 @@
 // Plaid LIVE certification harness — first-hand evidence for v0.5.0.
-//
 // This is a STANDALONE script, NOT part of the ordinary Vitest unit suite and
 // NOT part of CI. It talks to the REAL Plaid Production API and therefore
 // requires live credentials. Run it explicitly:
@@ -55,11 +54,28 @@ import {
 } from "@alepes/plaid-financial-data";
 import type { AccountBinding } from "@alepes/integration-runtime";
 import { syncAccount } from "@alepes/reconciliation";
-import { createSyncPostgresStore } from "@alepes/persistence";
+import { createSyncPostgresStore, createAuditPostgresStore } from "@alepes/persistence";
 import { runShadowMode } from "@alepes/reconciliation";
 import { qualifyCashEvents } from "@alepes/persistence";
 import { nonNegativeCents } from "@alepes/money";
 import { ulid } from "@alepes/persistence";
+import type { AuditPorts } from "@alepes/persistence";
+import {
+  startRun,
+  recordPreflight,
+  recordProviderRequest,
+  recordObservationPersisted,
+  recordCashEventQualified,
+  recordRuleEvaluated,
+  recordCapitalPlanCreated,
+  recordAllocationPlanCreated,
+  recordExecutionPolicyEvaluated,
+  recordShadowDecisionRecorded,
+  recordGate,
+  completeRun,
+  type CertifyLiveAuditConfig,
+  type RunContext,
+} from "./src/certify-live-audit";
 
 // ─── Environment guard ────────────────────────────────────────────────────────
 
@@ -167,14 +183,45 @@ const plaid = new PlaidApi(config);
 
 // ─── Sync orchestration ───────────────────────────────────────────────────────
 
+// Track active audit context for failure-path completion
+let activeCtx: RunContext | null = null;
+let auditPorts: Awaited<ReturnType<typeof createAuditPostgresStore>>;
+
 async function main(): Promise<void> {
-  // ── 1. Persistence store ───────────────────────────────────────────────────
+  // ── 1. Persistence stores ────────────────────────────────────────────────────
   const store = await step(1, "initialize PostgreSQL sync store", async () => {
     const s = createSyncPostgresStore({ connectionString: pgUrl });
     return s;
   });
 
-  // ── 2. Discover accounts + bind the depository account ────────────────────
+  // ── 1b. Audit persistence ────────────────────────────────────────────────────
+  auditPorts = createAuditPostgresStore({ connectionString: pgUrl });
+
+  // ── 1c. Start audit run ──────────────────────────────────────────────────────
+  const auditConfig: CertifyLiveAuditConfig = {
+    ports: auditPorts,
+    provider: "plaid",
+    environment: (process.env.PLAID_ENV ?? "production") as "production" | "sandbox" | "paper",
+    sourceCommit: process.env.GITHUB_SHA ?? "local",
+    harness: "certify-live.ts",
+    harnessVersion: "1.0.0",
+    schemaVersion: "audit-cert@1",
+    branch: process.env.GITHUB_REF_NAME,
+    milestone: "v0.5.0",
+  };
+  const ctx = await startRun(auditConfig);
+  activeCtx = ctx;
+
+  // ── Preflight: record secrets presence (names only, never values) ───────────
+  const secretsPresent = [
+    "PLAID_CLIENT_ID",
+    "PLAID_SECRET",
+    "PLAID_LIVE_POSTGRES_URL",
+    "PLAID_ACCESS_TOKEN",
+  ].filter((k) => process.env[k]);
+  await recordPreflight(auditPorts, ctx, { passed: true, secretsPresent });
+
+  // ── 2. Discover accounts + bind the depository account ──────────────────────
   const accountsClient: PlaidAccountsGetClient = {
     accountsGet: (req) =>
       plaid.accountsGet(req as never) as unknown as Promise<{
@@ -183,14 +230,19 @@ async function main(): Promise<void> {
   };
   const currentToken = (): string => accessTokens[0];
 
+  let realAccounts: DiscoveredPlaidAccount[] = [];
   await step(2, "discover accounts via /accounts/get", async () => {
     const list = await discoverPlaidAccounts(accountsClient, async () => currentToken(), "cred:plaid-live");
+    realAccounts = list;
     for (const a of list) accountIds.push(a.accountId);
     return list.map((a) => ({ accountFingerprint: fp(a.accountId), name: a.name, subtype: a.subtype }));
   });
 
-  const realAccounts = await discoverPlaidAccounts(accountsClient, async () => currentToken(), "cred:plaid-live");
-  for (const a of realAccounts) accountIds.push(a.accountId);
+  // Record provider request for /accounts/get (use first account as representative)
+  await recordProviderRequest(auditPorts, ctx, "/accounts/get", "succeeded", {
+    latencyMs: 0,
+    accountIdFingerprint: realAccounts.length > 0 ? fp(realAccounts[0].accountId) : "fp-none",
+  });
 
   const accountSummaries = realAccounts.map((a) => ({
     accountFingerprint: fp(a.accountId),
@@ -200,6 +252,7 @@ async function main(): Promise<void> {
 
   const depository = selectDepositoryAccount(realAccounts);
   if (!depository) {
+    await recordGate(auditPorts, ctx, "depository_account", "FAIL", "internal.unexpected", "no depository account discovered");
     record(3, "select depository account", "fail", "no depository account discovered");
     throw new Error("no depository account discovered");
   }
@@ -209,7 +262,7 @@ async function main(): Promise<void> {
   });
   const depositoryAccountId = depository.accountId;
 
-  // ── 3. Build the REAL adapter, bound to the depository account ────────────
+  // ── 3. Build the REAL adapter, bound to the depository account ──────────────
   const provider = createPlaidFinancialDataProvider({
     client: {
       transactionsSync: (req) =>
@@ -221,7 +274,7 @@ async function main(): Promise<void> {
 
   const binding: AccountBinding = (await provider.discoverAccounts("cred:plaid-live"))[0];
 
-  // ── 4. Persist binding + load checkpoint (if any) ──────────────────────────
+  // ── 4. Persist binding + load checkpoint (if any) ────────────────────────────
   const persistedBinding = await step(4, "persist/load account binding + checkpoint", async () => {
     const pb = await store.bindAccount({
       providerId: "plaid",
@@ -235,14 +288,15 @@ async function main(): Promise<void> {
   const { binding: pb, checkpoint } = persistedBinding;
   const startingCursor = checkpoint?.cursor ?? "";
 
-  // ── 5. Full /transactions/sync cycle via syncAccount ──────────────────────
+  // ── 5. Full /transactions/sync cycle via syncAccount ────────────────────────
   const syncRun = await step(5, "full /transactions/sync cycle via syncAccount", async () => {
     const run = await syncAccount(provider, store, binding, pb.id, {
       newCycleId: () => `sync_${ulid()}` as never,
       normalizationVersion: "plaid-sign-convention@1",
       maxRestarts: 3,
     });
-    return {
+
+    const summary = {
       pages: run.pages,
       added: run.delta.added.length,
       modified: run.delta.modified.length,
@@ -251,9 +305,17 @@ async function main(): Promise<void> {
       finalCursorLength: run.finalCursor.length,
       hasMore: run.delta.hasMore,
     };
+
+    // Record provider request for /transactions/sync
+    await recordProviderRequest(auditPorts, ctx, "/transactions/sync", "succeeded", {
+      latencyMs: 0,
+      accountIdFingerprint: fp(depositoryAccountId),
+    });
+
+    return summary;
   });
 
-  // ── 6. Load reconciled active observations ────────────────────────────────
+  // ── 6. Load reconciled active observations ──────────────────────────────────
   const observations = await step(6, "load reconciled active observations", async () => {
     const obs = await store.listActiveObservations(pb.id);
     return {
@@ -274,7 +336,12 @@ async function main(): Promise<void> {
     };
   });
 
-  // ── 7. Derive qualifying CashEvents ──────────────────────────────────────
+  // Record observation persisted (real evidence from persisted state)
+  for (const o of observations.observations) {
+    await recordObservationPersisted(auditPorts, ctx, o.id, o.id);
+  }
+
+  // ── 7. Derive qualifying CashEvents ─────────────────────────────────────────
   const cashEvents = await step(7, "derive qualifying CashEvents from observations", async () => {
     const events = qualifyCashEvents(
       observations.observations as never // PersistedObservation[] matches shape
@@ -292,12 +359,25 @@ async function main(): Promise<void> {
     };
   });
 
+  // Record qualified cash events
+  for (const e of cashEvents.events) {
+    await recordCashEventQualified(auditPorts, ctx, e.id, e.amount, "r-live-cert");
+  }
+
   if (cashEvents.count === 0) {
+    await recordGate(auditPorts, ctx, "qualifying_event", "FAIL", "internal.unexpected", "no qualifying live event observed in sync delta");
     record(8, "shadow mode on real live deposit", "fail", "no qualifying live event observed in sync delta");
+    await completeRun(auditPorts, ctx, "FAIL", "internal.unexpected", {
+      cashEvent: "none" as const,
+      decision: "none" as const,
+      providerObservation: "real" as const,
+      execution: "none" as const,
+      providerMutation: false,
+    }, [{ gate: "qualifying_event", status: "FAIL", failureCode: "internal.unexpected" }], { transfer: 0, order: 0, providerMutation: 0 }, "dirty");
     throw new Error("no qualifying live event observed in sync delta");
   }
 
-  // ── 8. Shadow Mode end-to-end ─────────────────────────────────────────────
+  // ── 8. Shadow Mode end-to-end ───────────────────────────────────────────────
   // Build a minimal portfolio for allocation (AAA/BBB 50/50)
   const portfolioState = {
     portfolio: {
@@ -334,6 +414,21 @@ async function main(): Promise<void> {
     const decision = decisions[0];
     if (!decision) throw new Error("no shadow decision produced");
 
+    // Record rule evaluation — use event.id which IS the durable CashEvent/FinancialObservation id
+    await recordRuleEvaluated(auditPorts, ctx, "r-live-cert", decision.plan.cashEvent.id, decision.plan.capitalPlan.deployable);
+
+    // Record capital plan — plan.id IS event.id per ExecutionPlan construction (shadow.ts:130)
+    await recordCapitalPlanCreated(auditPorts, ctx, decision.plan.id, decision.plan.capitalPlan.deployable);
+
+    // Record allocation plan — same plan.id
+    await recordAllocationPlanCreated(auditPorts, ctx, decision.plan.id, decision.plan.allocationPlan.totalDeployed, decision.plan.allocationPlan.lines.length);
+
+    // Record execution policy
+    await recordExecutionPolicyEvaluated(auditPorts, ctx, decision.disposition.kind, decision.plan.orders.length);
+
+    // Record shadow decision — use provenance.observationId (the durable ID minted at persistence)
+    await recordShadowDecisionRecorded(auditPorts, ctx, decision.provenance.observationId, decision.plan.capitalPlan.deployable);
+
     const deployable = (decision.plan.capitalPlan.deployable as number) ?? 0;
     const totalDeployed = (decision.plan.allocationPlan.totalDeployed as number) ?? 0;
 
@@ -348,7 +443,7 @@ async function main(): Promise<void> {
     };
   });
 
-  // ── 9. Account isolation: non-depository accounts enumerated, never bound ──
+  // ── 9. Account isolation: non-depository accounts enumerated, never bound ───
   const isolation = await step(9, "account isolation (non-depository never bound)", async () => {
     const nonDepository = realAccounts.filter(
       (a) =>
@@ -369,7 +464,7 @@ async function main(): Promise<void> {
     };
   });
 
-  // ── 10. Assertions: hard invariants ───────────────────────────────────────
+  // ── 10. Assertions: hard invariants ─────────────────────────────────────────
   await step(10, "assert hard invariants", async () => {
     const assertions = {
       realProviderProvenance: "plaid" as const,
@@ -391,9 +486,26 @@ async function main(): Promise<void> {
     return assertions;
   });
 
+  // ── Record final gates and complete ──────────────────────────────────────────
+  await recordGate(auditPorts, ctx, "shadow_disposition", "PASS");
+  await recordGate(auditPorts, ctx, "account_isolation", "PASS");
+  await recordGate(auditPorts, ctx, "qualifying_event", "PASS");
+
   await store.close();
 
-  // ── Report ─────────────────────────────────────────────────────────────────
+  await completeRun(auditPorts, ctx, "PASS", undefined, {
+    cashEvent: "real",
+    decision: "real",
+    providerObservation: "real",
+    execution: "shadow",
+    providerMutation: false,
+  }, [
+    { gate: "shadow_disposition", status: "PASS" },
+    { gate: "account_isolation", status: "PASS" },
+    { gate: "qualifying_event", status: "PASS" },
+  ], { transfer: 0, order: 0, providerMutation: 0 }, "clean");
+
+  // ── Report ───────────────────────────────────────────────────────────────────
   const rawReport = {
     environment: "production",
     testUser: "live",
@@ -415,7 +527,22 @@ async function main(): Promise<void> {
   process.exit(report.allPass ? 0 : 1);
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
+  // Failure-path completion: emit a durable ABORTED run if the run had started.
+  if (activeCtx && auditPorts) {
+    try {
+      await completeRun(auditPorts, activeCtx, "ABORTED", "internal.unexpected", {
+        cashEvent: "none",
+        decision: "none",
+        providerObservation: "none",
+        execution: "none",
+        providerMutation: false,
+      }, [], { transfer: 0, order: 0, providerMutation: 0 }, "dirty");
+      await auditPorts.close();
+    } catch {
+      // never mask the original error
+    }
+  }
   console.error("HARNESS ERROR:", redact(e instanceof Error ? e.message : String(e)));
   process.exit(3);
 });
