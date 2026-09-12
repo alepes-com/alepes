@@ -36,7 +36,8 @@
       "@alepes/plaid-financial-data": ["./packages/integrations/plaid-financial-data/src/index.ts"],
       "@alepes/alpaca-brokerage-data": ["./packages/integrations/alpaca-brokerage-data/src/index.ts"],
       "@alepes/audit": ["./packages/audit/src/index.ts"],
-      "@alepes/reporting": ["./packages/reporting/src/index.ts"]
+      "@alepes/reporting": ["./packages/reporting/src/index.ts"],
+      "@alepes/observability": ["./packages/observability/src/index.ts"]
     }
   },
   "include": [

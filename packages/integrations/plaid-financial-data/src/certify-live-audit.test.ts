@@ -2,8 +2,19 @@
 // Uses a fake in-memory AuditPorts — no Postgres, no Plaid, no network.
 
 import { describe, it, expect, beforeEach } from "vitest";
-import type { AuditPorts, CreateCertificationRunInput, CompleteCertificationRunInput, AuditEvent, PersistedCertificationRun, GateResult, EvidenceBoundary, FailureCode } from "@alepes/persistence";
-import type { EvidenceKind } from "@alepes/audit";
+import type {
+  AuditPorts,
+  CreateCertificationRunInput,
+  CompleteCertificationRunInput,
+  PersistedCertificationRun,
+} from "@alepes/persistence";
+import type {
+  AuditEvent,
+  GateResult,
+  EvidenceBoundary,
+  FailureCode,
+  EvidenceKind,
+} from "@alepes/audit";
 import { ulid } from "@alepes/persistence";
 import { cents, nonNegativeCents } from "@alepes/money";
 import {

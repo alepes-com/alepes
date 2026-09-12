@@ -20,6 +20,7 @@ const packages = [
   "temporal-workflows",
   "audit",
   "reporting",
+  "observability",
 ];
 const alias: Record<string, string> = {
   "@": path.resolve(dirname, "./src"),
