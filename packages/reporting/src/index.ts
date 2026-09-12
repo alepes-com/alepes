@@ -372,3 +372,50 @@ export function renderConsoleSummary(report: CertificationReportV1): string {
     `  Final: ${r.finalState}`,
   ].join("\n");
 }
+
+// ─── Reconstruction Source (structural, avoids @alepes/persistence import cycle) ───────
+
+/** Minimal source interface for reconstruction — callers provide loaders, not full ports. */
+export interface ReconstructionSource {
+  /** Load the certification run by runId. */
+  loadRun(runId: string): Promise<CertificationRun | null>;
+  /** List all audit events for a run in deterministic sequence order. */
+  listEvents(runId: string): Promise<AuditEvent[]>;
+  /** List provider call evidence for a run. */
+  listProviderCalls(runId: string): Promise<ProviderCallEvidence[]>;
+}
+
+/** Create a reconstruction source from full AuditPorts. */
+export function createReconstructionSource(ports: { runs: { loadRun: (runId: string) => Promise<CertificationRun | null> }; events: { listByRun: (runId: string) => Promise<AuditEvent[]> }; providerCalls: { listByRun: (runId: string) => Promise<ProviderCallEvidence[]> } }): ReconstructionSource {
+  return {
+    loadRun: ports.runs.loadRun,
+    listEvents: ports.events.listByRun,
+    listProviderCalls: ports.providerCalls.listByRun,
+  };
+}
+
+// ─── Reconstruction Entry Point (from persisted evidence, no stdout) ──────────
+
+/**
+ * Given a runId and a reconstruction source, assemble the canonical internal
+ * CertificationReportV1 by loading the run, its ordered events, and provider calls.
+ * This is the single point where durable evidence becomes a versioned report.
+ */
+export async function reconstructCertificationReport(
+  source: ReconstructionSource,
+  runId: string
+): Promise<CertificationReportV1 | null> {
+  const run = await source.loadRun(runId);
+  if (!run) {
+    return null;
+  }
+  const events = await source.listEvents(runId);
+  const providerCalls = await source.listProviderCalls(runId);
+
+  return {
+    schemaVersion: CERTIFICATION_REPORT_SCHEMA_VERSION,
+    run,
+    events,
+    providerCalls,
+  };
+}
