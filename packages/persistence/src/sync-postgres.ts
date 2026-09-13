@@ -1,6 +1,7 @@
 // PostgreSQL adapter for the provider-sync ports. This is the ONLY module that
 // knows the SQL for financial-data synchronization state.
 
+import { createHash } from "node:crypto";
 import { Pool } from "pg";
 import type { ExternalObservationRef, FinancialObservationId, AccountBalanceSnapshot } from "@alepes/domain";
 import { selectAccountBalance } from "@alepes/domain";
@@ -28,6 +29,62 @@ export interface SyncPostgresConfig {
   connectionString: string;
 }
 
+/** Deterministic fingerprint for cursor verification (sha256 hex, first 16 chars + length). */
+export function cursorFingerprint(cursor: string): string {
+  const hash = createHash("sha256").update(cursor).digest("hex");
+  return `fp-${hash.slice(0, 16)}-len${cursor.length}`;
+}
+
+/**
+ * Fail-closed checkpoint persistence with read-back verification from a SEPARATE connection.
+ * Throws if connectionString is missing/empty, if write fails, or if read-back
+ * from a fresh pool does not match the exact cursor bytes. Returns the verified fingerprint.
+ */
+export async function persistBaselineCheckpoint(connectionString: string, input: {
+  accountBindingId: AccountBindingId;
+  cursor: string;
+  status: "reconciled" | "idle" | "syncing" | "failed";
+}): Promise<{ persisted: true; fingerprint: string }> {
+  if (!connectionString?.trim()) {
+    throw new Error("PLAID_LIVE_POSTGRES_URL must be a non-empty PostgreSQL connection string");
+  }
+
+  // WRITER: fresh pool, upsert, close immediately
+  const writer = new Pool({ connectionString });
+  try {
+    await writer.query(
+      `INSERT INTO ${T_CHECKPOINTS} (account_binding_id, cursor, status, last_success_at, updated_at)
+       VALUES ($1, $2, $3, now(), now())
+       ON CONFLICT (account_binding_id) DO UPDATE SET cursor=$2, status=$3, last_success_at=now(), updated_at=now()`,
+      [input.accountBindingId, input.cursor, input.status]
+    );
+  } finally {
+    await writer.end();
+  }
+
+  // READER: BRAND-NEW pool (separate connection/process), byte-exact read-back
+  const reader = new Pool({ connectionString });
+  try {
+    const written = await reader.query(
+      `SELECT cursor FROM ${T_CHECKPOINTS} WHERE account_binding_id = $1`,
+      [input.accountBindingId]
+    );
+    if (written.rows.length === 0) {
+      throw new Error("Checkpoint write succeeded but read-back returned zero rows");
+    }
+    const actualCursor = written.rows[0].cursor ?? "";
+    if (actualCursor !== input.cursor) {
+      throw new Error(
+        `Checkpoint read-back mismatch: expected ${input.cursor.length} chars, got ${actualCursor.length} chars`
+      );
+    }
+    const fingerprint = cursorFingerprint(actualCursor);
+    return { persisted: true, fingerprint };
+  } finally {
+    await reader.end();
+  }
+}
+
 /** A deterministic 32-bit advisory-lock key derived from the binding id. */
 function advisoryLockKey(bindingId: AccountBindingId): number {
   // FNV-1a over the binding id string → 32-bit unsigned, stable across nodes.
@@ -46,6 +103,9 @@ function newObservationId(): FinancialObservationId {
 }
 
 export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncStore & { close(): Promise<void> } {
+  if (!cfg.connectionString?.trim()) {
+    throw new Error("PLAID_LIVE_POSTGRES_URL must be a non-empty PostgreSQL connection string");
+  }
   const pool = new Pool({ connectionString: cfg.connectionString });
 
   async function bindAccount(input: {
