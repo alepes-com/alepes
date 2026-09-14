@@ -58,12 +58,16 @@ import { createSyncPostgresStore, createAuditPostgresStore } from "@alepes/persi
 import { runShadowMode } from "@alepes/reconciliation";
 import { qualifyCashEvents } from "@alepes/persistence";
 import { nonNegativeCents } from "@alepes/money";
+import type { Cents } from "@alepes/money";
 import { ulid } from "@alepes/persistence";
 import type { AuditPorts } from "@alepes/persistence";
+import type { FinancialObservationId } from "@alepes/domain";
 import {
   startRun,
   recordPreflight,
   recordProviderRequest,
+  recordObservationReceived,
+  recordObservationNormalized,
   recordObservationPersisted,
   recordCashEventQualified,
   recordRuleEvaluated,
@@ -71,8 +75,10 @@ import {
   recordAllocationPlanCreated,
   recordExecutionPolicyEvaluated,
   recordShadowDecisionRecorded,
+  recordExecutionBlocked,
   recordGate,
   completeRun,
+  mapProviderErrorToFailureCode,
   type CertifyLiveAuditConfig,
   type RunContext,
 } from "./src/certify-live-audit";
@@ -186,6 +192,8 @@ const plaid = new PlaidApi(config);
 // Track active audit context for failure-path completion
 let activeCtx: RunContext | null = null;
 let auditPorts: Awaited<ReturnType<typeof createAuditPostgresStore>>;
+// Prevent double-completion in catch handler
+let runCompleted = false;
 
 async function main(): Promise<void> {
   // ── 1. Persistence stores ────────────────────────────────────────────────────
@@ -286,15 +294,37 @@ async function main(): Promise<void> {
     return { binding: pb, checkpoint: checkpoint ?? null };
   });
   const { binding: pb, checkpoint } = persistedBinding;
-  const startingCursor = checkpoint?.cursor ?? "";
+
+  // FAIL-CLOSED: Certification requires a nonempty persisted starting checkpoint.
+  // Without it, we cannot prove the delta is fresh vs. historical.
+  if (!checkpoint || !checkpoint.cursor || checkpoint.cursor.length === 0) {
+    await recordGate(auditPorts, ctx, "baseline_checkpoint", "FAIL", "sync.no_qualifying_event", "no persisted starting checkpoint — cannot certify fresh delta");
+    record(4, "verify starting checkpoint", "fail", "no persisted starting checkpoint — cannot certify fresh delta");
+    runCompleted = true;
+    await completeRun(auditPorts, ctx, "ABORTED", "sync.no_qualifying_event", {
+      cashEvent: "none",
+      decision: "none",
+      providerObservation: "none",
+      execution: "none",
+      providerMutation: false,
+    }, [{ gate: "baseline_checkpoint", status: "FAIL", failureCode: "sync.no_qualifying_event" }], { transfer: 0, order: 0, providerMutation: 0 }, "dirty");
+    throw new Error("FAIL-CLOSED: no persisted starting checkpoint — cannot certify fresh delta");
+  }
+  const startingCursor = checkpoint.cursor;
 
   // ── 5. Full /transactions/sync cycle via syncAccount ────────────────────────
+  // Hoist fresh delta observation IDs so step(6) can filter on them
+  let freshDeltaObservationIds: Set<string> = new Set();
+
   const syncRun = await step(5, "full /transactions/sync cycle via syncAccount", async () => {
     const run = await syncAccount(provider, store, binding, pb.id, {
       newCycleId: () => `sync_${ulid()}` as never,
       normalizationVersion: "plaid-sign-convention@1",
       maxRestarts: 3,
     });
+
+    // Capture fresh delta observation identities for certification — ONLY these are eligible
+    freshDeltaObservationIds = new Set(run.addedObservationIds.map((id: FinancialObservationId) => String(id)));
 
     const summary = {
       pages: run.pages,
@@ -315,12 +345,14 @@ async function main(): Promise<void> {
     return summary;
   });
 
-  // ── 6. Load reconciled active observations ──────────────────────────────────
-  const observations = await step(6, "load reconciled active observations", async () => {
-    const obs = await store.listActiveObservations(pb.id);
+  // ── 6. Load reconciled active observations, restricted to fresh delta ───────────
+  const freshDeltaObs = await step(6, "load fresh-delta observations", async () => {
+    const allObs = await store.listActiveObservations(pb.id);
+    // Keep ONLY observations whose Alepes observation ID is in the fresh delta
+    const fresh = allObs.filter((o: { id: string }) => freshDeltaObservationIds.has(o.id));
     return {
-      count: obs.length,
-      observations: obs.map((o) => ({
+      count: fresh.length,
+      observations: fresh.map((o) => ({
         id: o.id,
         externalRefFingerprint: fp(String(o.id)),
         direction: o.direction,
@@ -336,15 +368,17 @@ async function main(): Promise<void> {
     };
   });
 
-  // Record observation persisted (real evidence from persisted state)
-  for (const o of observations.observations) {
+  // Emit full lifecycle for each fresh-delta observation
+  for (const o of freshDeltaObs.observations) {
+    await recordObservationReceived(auditPorts, ctx, o.id, o.externalRefFingerprint, o.direction, o.amountCents as Cents, o.status === "posted");
+    await recordObservationNormalized(auditPorts, ctx, o.id, "plaid-sign-convention@1");
     await recordObservationPersisted(auditPorts, ctx, o.id, o.id);
   }
 
-  // ── 7. Derive qualifying CashEvents ─────────────────────────────────────────
-  const cashEvents = await step(7, "derive qualifying CashEvents from observations", async () => {
+  // ── 7. Derive qualifying CashEvents (from fresh delta ONLY) ──────────────────
+  const cashEvents = await step(7, "derive qualifying CashEvents from fresh delta", async () => {
     const events = qualifyCashEvents(
-      observations.observations as never // PersistedObservation[] matches shape
+      freshDeltaObs.observations as never // PersistedObservation[] matches shape
     );
     return {
       count: events.length,
@@ -365,15 +399,16 @@ async function main(): Promise<void> {
   }
 
   if (cashEvents.count === 0) {
-    await recordGate(auditPorts, ctx, "qualifying_event", "FAIL", "internal.unexpected", "no qualifying live event observed in sync delta");
+    await recordGate(auditPorts, ctx, "qualifying_event", "FAIL", "sync.no_qualifying_event", "no qualifying live event observed in sync delta");
     record(8, "shadow mode on real live deposit", "fail", "no qualifying live event observed in sync delta");
-    await completeRun(auditPorts, ctx, "FAIL", "internal.unexpected", {
+    runCompleted = true;
+    await completeRun(auditPorts, ctx, "FAIL", "sync.no_qualifying_event", {
       cashEvent: "none" as const,
       decision: "none" as const,
       providerObservation: "real" as const,
       execution: "none" as const,
       providerMutation: false,
-    }, [{ gate: "qualifying_event", status: "FAIL", failureCode: "internal.unexpected" }], { transfer: 0, order: 0, providerMutation: 0 }, "dirty");
+    }, [{ gate: "qualifying_event", status: "FAIL", failureCode: "sync.no_qualifying_event" }], { transfer: 0, order: 0, providerMutation: 0 }, "dirty");
     throw new Error("no qualifying live event observed in sync delta");
   }
 
@@ -409,7 +444,7 @@ async function main(): Promise<void> {
   } as never;
 
   const shadow = await step(8, "Shadow Mode: real live deposit → shadow decision", async () => {
-    const persistedObs = observations.observations.filter((o) => o.status === "posted" && o.direction === "credit");
+    const persistedObs = freshDeltaObs.observations.filter((o) => o.status === "posted" && o.direction === "credit");
     const decisions = runShadowMode(persistedObs as never, { rules: [rule], portfolioState });
     const decision = decisions[0];
     if (!decision) throw new Error("no shadow decision produced");
@@ -428,6 +463,9 @@ async function main(): Promise<void> {
 
     // Record shadow decision — use provenance.observationId (the durable ID minted at persistence)
     await recordShadowDecisionRecorded(auditPorts, ctx, decision.provenance.observationId, decision.plan.capitalPlan.deployable);
+
+    // Record execution blocked (v0.5 invariant: Shadow never reaches live execution)
+    await recordExecutionBlocked(auditPorts, ctx, "shadow");
 
     const deployable = (decision.plan.capitalPlan.deployable as number) ?? 0;
     const totalDeployed = (decision.plan.allocationPlan.totalDeployed as number) ?? 0;
@@ -493,6 +531,7 @@ async function main(): Promise<void> {
 
   await store.close();
 
+  runCompleted = true;
   await completeRun(auditPorts, ctx, "PASS", undefined, {
     cashEvent: "real",
     decision: "real",
@@ -512,7 +551,7 @@ async function main(): Promise<void> {
     boundAccount: { fingerprint: fp(depositoryAccountId), subtype: depository.subtype },
     accounts: accountSummaries,
     initialSync: { pages: syncRun.pages, added: syncRun.added, modified: syncRun.modified, removed: syncRun.removed },
-    reconciledObservations: observations.count,
+    reconciledObservations: freshDeltaObs.count,
     cashEvents: cashEvents.count,
     shadow,
     isolation,
@@ -529,9 +568,18 @@ async function main(): Promise<void> {
 
 main().catch(async (e) => {
   // Failure-path completion: emit a durable ABORTED run if the run had started.
-  if (activeCtx && auditPorts) {
+  // Guard against double-completion when completeRun already called before throw.
+  if (activeCtx && auditPorts && !runCompleted) {
     try {
-      await completeRun(auditPorts, activeCtx, "ABORTED", "internal.unexpected", {
+      // Map provider error to stable failure taxonomy
+      const failureCode = mapProviderErrorToFailureCode({
+        httpStatus: e?.httpStatus,
+        plaidErrorType: e?.plaidErrorType,
+        plaidErrorCode: e?.plaidErrorCode,
+        plaidRequestId: e?.plaidRequestId,
+      });
+      runCompleted = true;
+      await completeRun(auditPorts, activeCtx, "ABORTED", failureCode, {
         cashEvent: "none",
         decision: "none",
         providerObservation: "none",

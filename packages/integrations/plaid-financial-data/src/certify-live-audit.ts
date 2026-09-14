@@ -410,7 +410,7 @@ export async function completeRun(
 
 // ─── Local helper ────────────────────────────────────────────────────────────
 
-function mapProviderErrorToFailureCode(detail: {
+export function mapProviderErrorToFailureCode(detail: {
   httpStatus?: number;
   plaidErrorType?: string;
   plaidErrorCode?: string;
