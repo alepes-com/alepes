@@ -273,6 +273,10 @@ function rowToEvent(row: {
   }
 }
 
+function toIso(v: string | Date | null): string | null {
+  return v == null ? null : typeof v === "string" ? v : (v as Date).toISOString();
+}
+
 function rowToRun(row: {
   run_id: string;
   correlation_id: string;
@@ -295,9 +299,6 @@ function rowToRun(row: {
   created_at: string | Date;
   updated_at: string | Date;
 }): PersistedCertificationRun {
-  const toIso = (v: string | Date | null): string | null =>
-    v == null ? null : typeof v === "string" ? v : (v as Date).toISOString();
-
   return {
     runId: row.run_id,
     correlationId: row.correlation_id,
