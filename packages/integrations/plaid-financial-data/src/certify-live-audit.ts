@@ -181,6 +181,27 @@ export async function recordProviderRequest(
   }
 
   await ports.events.append(event);
+
+  // Persist durable provider-call evidence for every COMPLETED outcome
+  // (succeeded or failed). "started" is a begin marker only — there is no
+  // outcome yet, so no evidence row. This keeps the provider_call_evidence
+  // ledger byte-aligned with the completed provider interactions.
+  if (outcome !== "started") {
+    await ports.providerCalls.record({
+      evidenceId: ulid(),
+      runId: ctx.runId,
+      correlationId: ctx.correlationId,
+      occurredAt: new Date().toISOString(),
+      operation,
+      httpStatus: detail.httpStatus,
+      plaidErrorType: detail.plaidErrorType,
+      plaidErrorCode: detail.plaidErrorCode,
+      plaidRequestId: detail.plaidRequestId,
+      ...(outcome === "failed"
+        ? { failureCode: mapProviderErrorToFailureCode(detail) }
+        : {}),
+    });
+  }
 }
 
 // ─── Observation lifecycle ───────────────────────────────────────────────────

@@ -154,6 +154,27 @@ function redact(s: unknown): unknown {
   return out;
 }
 
+// ─── Provider error classification (module scope; captures nothing) ───────────
+
+type HttpErrorFields = {
+  httpStatus?: number;
+  plaidErrorType?: string;
+  plaidErrorCode?: string;
+  plaidRequestId?: string;
+};
+
+function classifyErr(e: unknown): HttpErrorFields {
+  const anyErr = e as Record<string, unknown> | undefined;
+  const resp = (anyErr?.response ?? {}) as Record<string, unknown>;
+  const data = (resp?.data ?? {}) as Record<string, unknown>;
+  return {
+    httpStatus: typeof resp?.status === "number" ? (resp.status as number) : undefined,
+    plaidErrorType: typeof data?.error_type === "string" ? (data.error_type as string) : undefined,
+    plaidErrorCode: typeof data?.error_code === "string" ? (data.error_code as string) : undefined,
+    plaidRequestId: typeof data?.request_id === "string" ? (data.request_id as string) : undefined,
+  };
+}
+
 // ─── Report accumulator ──────────────────────────────────────────────────────
 
 type Point = { id: number; name: string; status: "pass" | "fail"; detail?: unknown };
@@ -230,11 +251,23 @@ async function main(): Promise<void> {
   await recordPreflight(auditPorts, ctx, { passed: true, secretsPresent });
 
   // ── 2. Discover accounts + bind the depository account ──────────────────────
+  // Audit-wrap /accounts/get: PROVIDER_REQUEST_STARTED before the network call,
+  // then SUCCEEDED/FAILED + durable evidence after. This surfaces the STARTED
+  // arm before the call so a hang/failure is still recorded as attempted.
   const accountsClient: PlaidAccountsGetClient = {
-    accountsGet: (req) =>
-      plaid.accountsGet(req as never) as unknown as Promise<{
-        data: { accounts: Array<{ account_id: string; name: string; subtype: string | null }> };
-      }>,
+    accountsGet: async (req) => {
+      await recordProviderRequest(auditPorts, ctx, "/accounts/get", "started", {});
+      try {
+        const resp = await plaid.accountsGet(req as never) as unknown as {
+          data: { accounts: Array<{ account_id: string; name: string; subtype: string | null }> };
+        };
+        await recordProviderRequest(auditPorts, ctx, "/accounts/get", "succeeded", { latencyMs: 0 });
+        return resp;
+      } catch (e) {
+        await recordProviderRequest(auditPorts, ctx, "/accounts/get", "failed", classifyErr(e));
+        throw e;
+      }
+    },
   };
   const currentToken = (): string => accessTokens[0];
 
@@ -246,11 +279,8 @@ async function main(): Promise<void> {
     return list.map((a) => ({ accountFingerprint: fp(a.accountId), name: a.name, subtype: a.subtype }));
   });
 
-  // Record provider request for /accounts/get (use first account as representative)
-  await recordProviderRequest(auditPorts, ctx, "/accounts/get", "succeeded", {
-    latencyMs: 0,
-    accountIdFingerprint: realAccounts.length > 0 ? fp(realAccounts[0].accountId) : "fp-none",
-  });
+  // NOTE: /accounts/get is instrumented inside accountsClient (started + outcome +
+  // durable evidence row). No separate post-hoc record here.
 
   const accountSummaries = realAccounts.map((a) => ({
     accountFingerprint: fp(a.accountId),
@@ -271,11 +301,34 @@ async function main(): Promise<void> {
   const depositoryAccountId = depository.accountId;
 
   // ── 3. Build the REAL adapter, bound to the depository account ──────────────
+  // Audit-wrapped Plaid clients: every raw provider HTTP call is instrumented
+  // with PROVIDER_REQUEST_STARTED before the network call and
+  // SUCCEEDED/FAILED + a durable provider_call_evidence row after it. This
+  // satisfies the ADR: provider-call evidence is recorded per actual request,
+  // including each paginated /transactions/sync page, not one summary row.
+  const auditedTransactionsSync = async (
+    req: unknown
+  ): Promise<{ data: TransactionsSyncResponse }> => {
+    await recordProviderRequest(auditPorts, ctx, "/transactions/sync", "started", {
+      accountIdFingerprint: fp(depositoryAccountId),
+    });
+    try {
+      const resp = (await plaid.transactionsSync(req as never)) as unknown as {
+        data: TransactionsSyncResponse;
+      };
+      await recordProviderRequest(auditPorts, ctx, "/transactions/sync", "succeeded", {
+        latencyMs: 0,
+        accountIdFingerprint: fp(depositoryAccountId),
+      });
+      return resp;
+    } catch (e) {
+      await recordProviderRequest(auditPorts, ctx, "/transactions/sync", "failed", classifyErr(e));
+      throw e;
+    }
+  };
+
   const provider = createPlaidFinancialDataProvider({
-    client: {
-      transactionsSync: (req) =>
-        plaid.transactionsSync(req as never) as unknown as Promise<{ data: TransactionsSyncResponse }>,
-    },
+    client: { transactionsSync: auditedTransactionsSync },
     resolveAccessToken: async () => currentToken(),
     discover: async () => [{ accountId: depositoryAccountId, name: depository.name }],
   });
@@ -336,11 +389,9 @@ async function main(): Promise<void> {
       hasMore: run.delta.hasMore,
     };
 
-    // Record provider request for /transactions/sync
-    await recordProviderRequest(auditPorts, ctx, "/transactions/sync", "succeeded", {
-      latencyMs: 0,
-      accountIdFingerprint: fp(depositoryAccountId),
-    });
+    // NOTE: each actual /transactions/sync page request is instrumented at the
+    // client boundary (auditedTransactionsSync). No summary row here — that
+    // would double-write the provider-call evidence ledger.
 
     return summary;
   });

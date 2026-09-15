@@ -423,6 +423,54 @@ describe("certify-live-audit instrumentation", () => {
       expect(providerFailed!.payload.plaidRequestId).toBe("plaid-req-123");
     });
 
+  it("persists a durable provider_call evidence row for every completed call", async () => {
+    const ctx = await startRun(config);
+
+    // One succeeded call
+    await recordProviderRequest(ports, ctx, "/accounts/get", "started", { accountIdFingerprint: "fp-acc-1" });
+    await recordProviderRequest(ports, ctx, "/accounts/get", "succeeded", { latencyMs: 42, httpStatus: 200 });
+
+    // One failed call (a full /transactions/sync page attempt)
+    await recordProviderRequest(ports, ctx, "/transactions/sync", "started", {});
+    await recordProviderRequest(ports, ctx, "/transactions/sync", "failed", {
+      httpStatus: 500,
+      plaidErrorType: "API_ERROR",
+      plaidErrorCode: "INTERNAL_SERVER_ERROR",
+      plaidRequestId: "req-500",
+    });
+
+    // The durable provider-call evidence store must contain exactly the two completed outcomes
+    const evidence = await ports.providerCalls.listByRun(ctx.runId);
+    expect(evidence).toHaveLength(2);
+
+    const [getCall, syncCall] = evidence;
+    expect(getCall).toMatchObject({
+      runId: ctx.runId,
+      correlationId: ctx.correlationId,
+      operation: "/accounts/get",
+      httpStatus: 200,
+    });
+    expect(getCall.failureCode).toBeNull();
+
+    expect(syncCall).toMatchObject({
+      operation: "/transactions/sync",
+      httpStatus: 500,
+      plaidErrorType: "API_ERROR",
+      plaidErrorCode: "INTERNAL_SERVER_ERROR",
+      plaidRequestId: "req-500",
+    });
+    expect(syncCall.failureCode).toBe("provider.unavailable");
+
+    // No evidence row may leak a secret value or raw account identifier
+    for (const row of evidence) {
+      const serialized = JSON.stringify(row);
+      expect(serialized).not.toContain("access-");
+      expect(serialized).not.toMatch(/\bacct_/);
+      expect(serialized).not.toContain("PLAID_SECRET");
+      expect(serialized).not.toContain("PLAID_CLIENT_ID");
+    }
+  });
+
   it("sentinel secrets never appear in emitted events", async () => {
     const ctx = await startRun(config);
 
