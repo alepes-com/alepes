@@ -471,6 +471,64 @@ describe("certify-live-audit instrumentation", () => {
     }
   });
 
+  it("never emits PROVIDER_REQUEST_FAILED when the provider succeeds but success-evidence persistence throws", async () => {
+    const ctx = await startRun(config);
+
+    // Provider succeeds; the SUCCEEDED evidence row write throws.
+    const failingOnSuccess: AuditPorts = {
+      ...ports,
+      providerCalls: {
+        ...ports.providerCalls,
+        record: async (input) => {
+          // Only sabotage the row that records an outcome with NO failureCode
+          // (i.e. the success arm). The failed arm is unaffected.
+          if (input.failureCode === undefined) throw new Error("db write failed");
+          await ports.providerCalls.record(input);
+        },
+      },
+    };
+
+    const { callWithProviderEvidence } = await import("./certify-live-audit");
+
+    const err = await callWithProviderEvidence(
+      failingOnSuccess,
+      ctx,
+      "/accounts/get",
+      { latencyMs: 0 },
+      () => ({}), // classifyFailure unused here
+      async () => ({ data: 1 }) // provider succeeds
+    ).catch((e) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect(String(err)).toContain("db write failed");
+
+    const types = (await ports.events.listByRun(ctx.runId)).map((e) => e.type);
+    expect(types).toContain("PROVIDER_REQUEST_STARTED");
+    expect(types).not.toContain("PROVIDER_REQUEST_FAILED");
+  });
+
+  it("provider failure emits PROVIDER_REQUEST_FAILED with provider taxonomy", async () => {
+    const ctx = await startRun(config);
+    const { callWithProviderEvidence } = await import("./certify-live-audit");
+
+    const boom = await callWithProviderEvidence(
+      ports,
+      ctx,
+      "/transactions/sync",
+      {},
+      (e) => ({ httpStatus: (e as { response?: { status?: number } })?.response?.status }),
+      async () => {
+        throw { response: { status: 401 }, message: "unauthorized" };
+      }
+    ).catch((e) => e);
+
+    expect(boom).toBeTruthy();
+    const types = (await ports.events.listByRun(ctx.runId)).map((e) => e.type);
+    expect(types).toContain("PROVIDER_REQUEST_STARTED");
+    expect(types).toContain("PROVIDER_REQUEST_FAILED");
+    expect(types).not.toContain("PROVIDER_REQUEST_SUCCEEDED");
+  });
+
   it("sentinel secrets never appear in emitted events", async () => {
     const ctx = await startRun(config);
 

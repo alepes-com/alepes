@@ -79,6 +79,7 @@ import {
   recordGate,
   completeRun,
   mapProviderErrorToFailureCode,
+  callWithProviderEvidence,
   type CertifyLiveAuditConfig,
   type RunContext,
 } from "./src/certify-live-audit";
@@ -255,19 +256,18 @@ async function main(): Promise<void> {
   // then SUCCEEDED/FAILED + durable evidence after. This surfaces the STARTED
   // arm before the call so a hang/failure is still recorded as attempted.
   const accountsClient: PlaidAccountsGetClient = {
-    accountsGet: async (req) => {
-      await recordProviderRequest(auditPorts, ctx, "/accounts/get", "started", {});
-      try {
-        const resp = await plaid.accountsGet(req as never) as unknown as {
-          data: { accounts: Array<{ account_id: string; name: string; subtype: string | null }> };
-        };
-        await recordProviderRequest(auditPorts, ctx, "/accounts/get", "succeeded", { latencyMs: 0 });
-        return resp;
-      } catch (e) {
-        await recordProviderRequest(auditPorts, ctx, "/accounts/get", "failed", classifyErr(e));
-        throw e;
-      }
-    },
+    accountsGet: (req) =>
+      callWithProviderEvidence(
+        auditPorts,
+        ctx,
+        "/accounts/get",
+        { latencyMs: 0 },
+        classifyErr,
+        () =>
+          plaid.accountsGet(req as never) as unknown as Promise<{
+            data: { accounts: Array<{ account_id: string; name: string; subtype: string | null }> };
+          }>
+      ),
   };
   const currentToken = (): string => accessTokens[0];
 
@@ -306,26 +306,17 @@ async function main(): Promise<void> {
   // SUCCEEDED/FAILED + a durable provider_call_evidence row after it. This
   // satisfies the ADR: provider-call evidence is recorded per actual request,
   // including each paginated /transactions/sync page, not one summary row.
-  const auditedTransactionsSync = async (
+  const auditedTransactionsSync = (
     req: unknown
-  ): Promise<{ data: TransactionsSyncResponse }> => {
-    await recordProviderRequest(auditPorts, ctx, "/transactions/sync", "started", {
-      accountIdFingerprint: fp(depositoryAccountId),
-    });
-    try {
-      const resp = (await plaid.transactionsSync(req as never)) as unknown as {
-        data: TransactionsSyncResponse;
-      };
-      await recordProviderRequest(auditPorts, ctx, "/transactions/sync", "succeeded", {
-        latencyMs: 0,
-        accountIdFingerprint: fp(depositoryAccountId),
-      });
-      return resp;
-    } catch (e) {
-      await recordProviderRequest(auditPorts, ctx, "/transactions/sync", "failed", classifyErr(e));
-      throw e;
-    }
-  };
+  ): Promise<{ data: TransactionsSyncResponse }> =>
+    callWithProviderEvidence(
+      auditPorts,
+      ctx,
+      "/transactions/sync",
+      { latencyMs: 0, accountIdFingerprint: fp(depositoryAccountId) },
+      classifyErr,
+      () => plaid.transactionsSync(req as never) as unknown as Promise<{ data: TransactionsSyncResponse }>
+    );
 
   const provider = createPlaidFinancialDataProvider({
     client: { transactionsSync: auditedTransactionsSync },

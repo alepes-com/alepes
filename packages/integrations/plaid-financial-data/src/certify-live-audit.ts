@@ -139,6 +139,42 @@ export async function recordPreflight(
 
 // ─── Provider request lifecycle ──────────────────────────────────────────────
 
+export interface ProviderErrorDetail {
+  httpStatus?: number;
+  plaidErrorType?: string;
+  plaidErrorCode?: string;
+  plaidRequestId?: string;
+}
+
+/**
+ * Execute one real provider call with the correct exception boundary:
+ *   1. PROVIDER_REQUEST_STARTED is emitted BEFORE the network call.
+ *   2. The try/catch wraps ONLY the provider call. On provider throw:
+ *      PROVIDER_REQUEST_FAILED + durable evidence, then rethrow.
+ *   3. PROVIDER_REQUEST_SUCCEEDED + durable evidence happen AFTER the try —
+ *      if evidence persistence itself throws, that failure propagates as an
+ *      internal error and is NEVER mislabeled as a provider failure.
+ */
+export async function callWithProviderEvidence<T>(
+  ports: AuditPorts,
+  ctx: RunContext,
+  operation: string,
+  detail: { accountIdFingerprint?: string; latencyMs?: number } & ProviderErrorDetail,
+  classifyFailure: (e: unknown) => ProviderErrorDetail,
+  fn: () => Promise<T>
+): Promise<T> {
+  await recordProviderRequest(ports, ctx, operation, "started", detail);
+  let result: T;
+  try {
+    result = await fn();
+  } catch (e) {
+    await recordProviderRequest(ports, ctx, operation, "failed", classifyFailure(e));
+    throw e;
+  }
+  await recordProviderRequest(ports, ctx, operation, "succeeded", detail);
+  return result;
+}
+
 /** Record provider request lifecycle (STARTED / SUCCEEDED / FAILED). */
 export async function recordProviderRequest(
   ports: AuditPorts,
