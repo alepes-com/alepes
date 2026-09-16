@@ -378,6 +378,9 @@ async function main(): Promise<void> {
       finalCursorFingerprint: fp(run.finalCursor),
       finalCursorLength: run.finalCursor.length,
       hasMore: run.delta.hasMore,
+      // Telemetry: a missing balance snapshot makes qualification return null;
+      // surfacing this here makes that failure class visible without digging.
+      balanceSnapshotPresent: run.delta.accountBalance !== undefined,
     };
 
     // NOTE: each actual /transactions/sync page request is instrumented at the

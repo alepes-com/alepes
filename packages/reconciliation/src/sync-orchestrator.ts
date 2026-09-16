@@ -53,6 +53,9 @@ function mergeDelta(acc: ObservationSyncDelta, page: ObservationSyncDelta): Obse
     added: [...acc.added, ...page.added],
     modified: [...acc.modified, ...page.modified],
     removed: [...acc.removed, ...page.removed],
+    // Preserve the latest available account snapshot: later pages win when present;
+    // otherwise carry forward the accumulator's snapshot. Never fabricates one.
+    accountBalance: page.accountBalance ?? acc.accountBalance ?? undefined,
     nextCursor: page.nextCursor, // the FINAL page's cursor wins; intermediate ones are discarded
     hasMore: page.hasMore,
   };
@@ -134,6 +137,7 @@ export async function syncAccount(
       added: acc.added,
       modified: acc.modified,
       removed: acc.removed,
+      accountBalance: acc.accountBalance,
       nextCursor: acc.nextCursor,
       hasMore: false,
     },
