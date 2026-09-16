@@ -503,8 +503,10 @@ async function main(): Promise<void> {
     // Record allocation plan — same plan.id
     await recordAllocationPlanCreated(auditPorts, ctx, decision.plan.id, decision.plan.allocationPlan.totalDeployed, decision.plan.allocationPlan.lines.length);
 
-    // Record execution policy
-    await recordExecutionPolicyEvaluated(auditPorts, ctx, decision.disposition.kind, decision.plan.orders.length);
+    // Record execution policy — for Shadow disposition, NO orders are submitted
+    // or executed; proposed order count is reported via the harness return
+    // (`proposedOrderCount`) separately from this EXECUTED count.
+    await recordExecutionPolicyEvaluated(auditPorts, ctx, decision.disposition.kind, 0);
 
     // Record shadow decision — use provenance.observationId (the durable ID minted at persistence)
     await recordShadowDecisionRecorded(auditPorts, ctx, decision.provenance.observationId, decision.plan.capitalPlan.deployable);
@@ -520,7 +522,7 @@ async function main(): Promise<void> {
       deployableCents: deployable,
       totalDeployedCents: totalDeployed,
       cashEventIdFingerprint: fp(decision.plan.cashEvent.id),
-      orderCount: decision.plan.orders.length,
+      proposedOrderCount: decision.plan.orders.length,
       sourceDescription: decision.plan.cashEvent.description,
       nonExecuting: true,
     };
@@ -554,17 +556,19 @@ async function main(): Promise<void> {
       postedCredit: true,
       stableObservationIdentity: cashEvents.count > 0,
       shadowCount: 1,
-      executeCount: 0,
+      // A Shadow decision MAY propose orders; the v0.5 invariant is that NOTHING
+      // is executed / transferred / mutated at a real provider.
+      proposedOrderCount: shadow.proposedOrderCount,
+      executedOrderCount: 0,
       transferCount: 0,
-      orderCount: shadow.orderCount,
       providerMutationCount: 0,
       dispositionShadow: shadow.disposition === "shadow",
     };
 
     if (!assertions.dispositionShadow) throw new Error(`disposition=${shadow.disposition}, expected shadow`);
-    if (assertions.orderCount !== 0) throw new Error(`orderCount=${assertions.orderCount}, expected 0`);
-    if (assertions.executeCount !== 0) throw new Error(`executeCount=${assertions.executeCount}, expected 0`);
+    if (assertions.executedOrderCount !== 0) throw new Error(`executedOrderCount=${assertions.executedOrderCount}, expected 0`);
     if (assertions.transferCount !== 0) throw new Error(`transferCount=${assertions.transferCount}, expected 0`);
+    if (assertions.providerMutationCount !== 0) throw new Error(`providerMutationCount=${assertions.providerMutationCount}, expected 0`);
 
     return assertions;
   });

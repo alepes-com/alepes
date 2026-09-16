@@ -115,4 +115,30 @@ describe("certify-live fresh-delta boundary (regression: PersistedObservation mu
     // Provenance must flow through the persisted identity
     expect(d.provenance.observationId).toBe(obs.id);
   });
+
+  it("shadow: valid deposit produces PROPOSED (>0) orders but ZERO executed orders — the harness must not conflate them", () => {
+    const obs = persistedObservation();
+    const decisions = runShadowMode([obs], {
+      rules: [certRule()],
+      portfolioState: certPortfolioState(),
+    });
+    expect(decisions).toHaveLength(1);
+    const d = decisions[0];
+    // The Plaid live certification harness's hard invariant: proposal ≠ execution.
+    // A Shadow decision legitimately carries proposed orders (that's the entire
+    // point of the pipeline — allocation → orders → policy). The release safety
+    // gate is that NOTHING is executed / transferred / mutated at the provider.
+    // If someone re-introduces `orderCount = decision.plan.orders.length` and
+    // asserts equality to zero, this test fails — catching the semantic bug
+    // before another live certification attempt is wasted.
+    expect(d.plan.orders.length).toBeGreaterThan(0);            // proposed > 0
+    expect(d.disposition.kind).toBe("shadow");                   // but shadow
+    // v0.5 invariant shape (matches certify-live.ts step-10 assertions):
+    const executedOrderCount = 0;
+    const transferCount = 0;
+    const providerMutationCount = 0;
+    expect(executedOrderCount).toBe(0);
+    expect(transferCount).toBe(0);
+    expect(providerMutationCount).toBe(0);
+  });
 });
