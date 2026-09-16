@@ -60,7 +60,7 @@ import { qualifyCashEvents } from "@alepes/persistence";
 import { nonNegativeCents } from "@alepes/money";
 import type { Cents } from "@alepes/money";
 import { ulid } from "@alepes/persistence";
-import type { AuditPorts } from "@alepes/persistence";
+import type { AuditPorts, PersistedObservation } from "@alepes/persistence";
 import type { FinancialObservationId } from "@alepes/domain";
 import {
   startRun,
@@ -391,15 +391,17 @@ async function main(): Promise<void> {
   });
 
   // ── 6. Load reconciled active observations, restricted to fresh delta ───────────
+  // Keep the genuine PersistedObservation[] for computation; project only for reporting.
+  let freshPersistedObs: PersistedObservation[] = [];
   const freshDeltaObs = await step(6, "load fresh-delta observations", async () => {
     const allObs = await store.listActiveObservations(pb.id);
     // Keep ONLY observations whose Alepes observation ID is in the fresh delta
-    const fresh = allObs.filter((o: { id: string }) => freshDeltaObservationIds.has(o.id));
+    freshPersistedObs = allObs.filter((o) => freshDeltaObservationIds.has(String(o.id)));
     return {
-      count: fresh.length,
-      observations: fresh.map((o) => ({
+      count: freshPersistedObs.length,
+      observations: freshPersistedObs.map((o) => ({
         id: o.id,
-        externalRefFingerprint: fp(String(o.id)),
+        observationIdFingerprint: fp(String(o.id)),
         direction: o.direction,
         status: o.status,
         amountCents: o.amountCents,
@@ -415,16 +417,14 @@ async function main(): Promise<void> {
 
   // Emit full lifecycle for each fresh-delta observation
   for (const o of freshDeltaObs.observations) {
-    await recordObservationReceived(auditPorts, ctx, o.id, o.externalRefFingerprint, o.direction, o.amountCents as Cents, o.status === "posted");
+    await recordObservationReceived(auditPorts, ctx, o.id, o.observationIdFingerprint, o.direction, o.amountCents as Cents, o.status === "posted");
     await recordObservationNormalized(auditPorts, ctx, o.id, "plaid-sign-convention@1");
     await recordObservationPersisted(auditPorts, ctx, o.id, o.id);
   }
 
   // ── 7. Derive qualifying CashEvents (from fresh delta ONLY) ──────────────────
   const cashEvents = await step(7, "derive qualifying CashEvents from fresh delta", async () => {
-    const events = qualifyCashEvents(
-      freshDeltaObs.observations as never // PersistedObservation[] matches shape
-    );
+    const events = qualifyCashEvents(freshPersistedObs);
     return {
       count: events.length,
       events: events.map((e) => ({
@@ -489,8 +489,8 @@ async function main(): Promise<void> {
   } as never;
 
   const shadow = await step(8, "Shadow Mode: real live deposit → shadow decision", async () => {
-    const persistedObs = freshDeltaObs.observations.filter((o) => o.status === "posted" && o.direction === "credit");
-    const decisions = runShadowMode(persistedObs as never, { rules: [rule], portfolioState });
+    // runShadowMode re-applies qualification internally — pass the authoritative list.
+    const decisions = runShadowMode(freshPersistedObs, { rules: [rule], portfolioState });
     const decision = decisions[0];
     if (!decision) throw new Error("no shadow decision produced");
 
