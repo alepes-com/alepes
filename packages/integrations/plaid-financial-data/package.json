@@ -21,6 +21,8 @@
     "@alepes/domain": "*",
     "@alepes/integration-runtime": "*",
     "@alepes/audit": "*",
-    "@alepes/persistence": "*"
+    "@alepes/persistence": "*",
+    "@alepes/rules-engine": "*",
+    "@alepes/allocation-engine": "*"
   }
 }

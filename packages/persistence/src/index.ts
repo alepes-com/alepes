@@ -1,7 +1,7 @@
 export * from "./ports";
 export * from "./postgres";
 export * from "./sync-ports";
-export { createSyncPostgresStore, cursorFingerprint, persistBaselineCheckpoint } from "./sync-postgres";
+export { createSyncPostgresStore, cursorFingerprint } from "./sync-postgres";
 export { qualifyCashEvents } from "./reconcile";
 export {
   inputSnapshotHash,

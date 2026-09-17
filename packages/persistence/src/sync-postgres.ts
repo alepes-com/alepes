@@ -36,54 +36,11 @@ export function cursorFingerprint(cursor: string): string {
 }
 
 /**
- * Fail-closed checkpoint persistence with read-back verification from a SEPARATE connection.
- * Throws if connectionString is missing/empty, if write fails, or if read-back
- * from a fresh pool does not match the exact cursor bytes. Returns the verified fingerprint.
+ * Manual baseline-checkpoint persistence was REMOVED. A "reconciled" checkpoint
+ * must be produced ONLY via reconcileSyncCycle, which atomically writes the
+ * observation rows, events, and checkpoint together. No caller may bypass that
+ * invariant by minting a checkpoint with an arbitrary cursor.
  */
-export async function persistBaselineCheckpoint(connectionString: string, input: {
-  accountBindingId: AccountBindingId;
-  cursor: string;
-  status: "reconciled" | "idle" | "syncing" | "failed";
-}): Promise<{ persisted: true; fingerprint: string }> {
-  if (!connectionString?.trim()) {
-    throw new Error("PLAID_LIVE_POSTGRES_URL must be a non-empty PostgreSQL connection string");
-  }
-
-  // WRITER: fresh pool, upsert, close immediately
-  const writer = new Pool({ connectionString });
-  try {
-    await writer.query(
-      `INSERT INTO ${T_CHECKPOINTS} (account_binding_id, cursor, status, last_success_at, updated_at)
-       VALUES ($1, $2, $3, now(), now())
-       ON CONFLICT (account_binding_id) DO UPDATE SET cursor=$2, status=$3, last_success_at=now(), updated_at=now()`,
-      [input.accountBindingId, input.cursor, input.status]
-    );
-  } finally {
-    await writer.end();
-  }
-
-  // READER: BRAND-NEW pool (separate connection/process), byte-exact read-back
-  const reader = new Pool({ connectionString });
-  try {
-    const written = await reader.query(
-      `SELECT cursor FROM ${T_CHECKPOINTS} WHERE account_binding_id = $1`,
-      [input.accountBindingId]
-    );
-    if (written.rows.length === 0) {
-      throw new Error("Checkpoint write succeeded but read-back returned zero rows");
-    }
-    const actualCursor = written.rows[0].cursor ?? "";
-    if (actualCursor !== input.cursor) {
-      throw new Error(
-        `Checkpoint read-back mismatch: expected ${input.cursor.length} chars, got ${actualCursor.length} chars`
-      );
-    }
-    const fingerprint = cursorFingerprint(actualCursor);
-    return { persisted: true, fingerprint };
-  } finally {
-    await reader.end();
-  }
-}
 
 /** A deterministic 32-bit advisory-lock key derived from the binding id. */
 function advisoryLockKey(bindingId: AccountBindingId): number {
@@ -376,13 +333,17 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
 
   async function listActiveObservations(accountBindingId: AccountBindingId): Promise<PersistedObservation[]> {
     const res = await pool.query(
-      `SELECT id, account_binding_id, amount_cents, direction, status, qualification_balance_cents, last_reconciled_cycle_id, first_observed_at, posted_at, description, normalization_version, state, predecessor_observation_id, created_at, updated_at
-         FROM ${T_OBSERVATIONS} WHERE account_binding_id = $1 AND state = 'active' ORDER BY created_at`,
+      `SELECT o.id, o.account_binding_id, r.external_ref, o.amount_cents, o.direction, o.status, o.qualification_balance_cents, o.last_reconciled_cycle_id, o.first_observed_at, o.posted_at, o.description, o.normalization_version, o.state, o.predecessor_observation_id, o.created_at, o.updated_at
+         FROM ${T_OBSERVATIONS} o
+         LEFT JOIN ${T_REFS} r
+           ON r.financial_observation_id = o.id AND r.account_binding_id = o.account_binding_id
+        WHERE o.account_binding_id = $1 AND o.state = 'active' ORDER BY o.created_at`,
       [accountBindingId]
     );
     return res.rows.map((row) => ({
       id: row.id as FinancialObservationId,
       accountBindingId: row.account_binding_id as AccountBindingId,
+      externalRef: row.external_ref as ExternalObservationRef,
       amountCents: Number(row.amount_cents),
       direction: row.direction,
       status: row.status,

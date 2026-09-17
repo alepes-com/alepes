@@ -105,9 +105,9 @@ describe("assertShadowOnly", () => {
     expect(() =>
       assertShadowOnly({
         shadowCount: 1,
-        executeCount: 0,
+        executedOrderCount: 0,
         transferCount: 0,
-        orderCount: 0,
+        proposedOrderCount: 0,
         providerMutationCount: 0,
         disposition: "shadow",
       })
@@ -118,9 +118,9 @@ describe("assertShadowOnly", () => {
     expect(() =>
       assertShadowOnly({
         shadowCount: 1,
-        executeCount: 0,
+        executedOrderCount: 0,
         transferCount: 0,
-        orderCount: 0,
+        proposedOrderCount: 0,
         providerMutationCount: 0,
         disposition: "approval",
       })
@@ -131,9 +131,9 @@ describe("assertShadowOnly", () => {
     expect(() =>
       assertShadowOnly({
         shadowCount: 0,
-        executeCount: 0,
+        executedOrderCount: 0,
         transferCount: 0,
-        orderCount: 0,
+        proposedOrderCount: 0,
         providerMutationCount: 0,
         disposition: "shadow",
       })
@@ -144,31 +144,43 @@ describe("assertShadowOnly", () => {
     expect(() =>
       assertShadowOnly({
         shadowCount: 1,
-        executeCount: 0,
+        executedOrderCount: 0,
         transferCount: 1,
-        orderCount: 0,
         providerMutationCount: 0,
         disposition: "shadow",
       })
     ).toThrow(/transferCount/);
 
+    // proposedOrderCount may be > 0; it is NOT a mutation. But the harness must
+    // pass executedOrderCount separately, and it must be 0. The "orderCount → 1"
+    // legacy bug is exactly what we do NOT reintroduce.
     expect(() =>
       assertShadowOnly({
         shadowCount: 1,
-        executeCount: 0,
+        executedOrderCount: 0,
         transferCount: 0,
-        orderCount: 1,
+        providerMutationCount: 0,
+        disposition: "shadow",
+        proposedOrderCount: 1,
+      })
+    ).not.toThrow();
+
+    // Non-zero executedOrderCount is the violating case that must throw.
+    expect(() =>
+      assertShadowOnly({
+        shadowCount: 1,
+        executedOrderCount: 1,
+        transferCount: 0,
         providerMutationCount: 0,
         disposition: "shadow",
       })
-    ).toThrow(/orderCount/);
+    ).toThrow(/executedOrderCount/);
 
     expect(() =>
       assertShadowOnly({
         shadowCount: 1,
-        executeCount: 0,
+        executedOrderCount: 0,
         transferCount: 0,
-        orderCount: 0,
         providerMutationCount: 1,
         disposition: "shadow",
       })

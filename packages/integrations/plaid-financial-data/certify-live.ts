@@ -45,6 +45,7 @@
 // It never fabricates or substitutes an event.
 
 import { Configuration, PlaidApi, PlaidEnvironments, type TransactionsSyncResponse } from "plaid";
+import pg from "pg";
 import {
   createPlaidFinancialDataProvider,
   discoverPlaidAccounts,
@@ -54,14 +55,16 @@ import {
 } from "@alepes/plaid-financial-data";
 import type { AccountBinding } from "@alepes/integration-runtime";
 import { syncAccount } from "@alepes/reconciliation";
-import { createSyncPostgresStore, createAuditPostgresStore } from "@alepes/persistence";
+import { createSyncPostgresStore, createAuditPostgresStore, createPostgresPorts, inputSnapshotHash, hashCanonical } from "@alepes/persistence";
 import { runShadowMode } from "@alepes/reconciliation";
 import { qualifyCashEvents } from "@alepes/persistence";
+import { evaluateRules, toCapitalPlan } from "@alepes/rules-engine";
+import { allocate } from "@alepes/allocation-engine";
 import { nonNegativeCents } from "@alepes/money";
 import type { Cents } from "@alepes/money";
 import { ulid } from "@alepes/persistence";
-import type { AuditPorts, PersistedObservation } from "@alepes/persistence";
-import type { FinancialObservationId } from "@alepes/domain";
+import type { AuditPorts, PersistedObservation, PersistenceId } from "@alepes/persistence";
+import type { CashEvent, FinancialObservationId } from "@alepes/domain";
 import {
   startRun,
   recordPreflight,
@@ -216,6 +219,10 @@ let activeCtx: RunContext | null = null;
 let auditPorts: Awaited<ReturnType<typeof createAuditPostgresStore>>;
 // Prevent double-completion in catch handler
 let runCompleted = false;
+
+// ─── Canonical serialization for byte-identical recomputation (MILESTONE 5.4) ──
+const canonicalPlanHash = (plan: { capitalPlan: unknown; allocationPlan: unknown }) =>
+  hashCanonical({ capitalPlan: plan.capitalPlan, allocationPlan: plan.allocationPlan });
 
 async function main(): Promise<void> {
   // ── 1. Persistence stores ────────────────────────────────────────────────────
@@ -393,34 +400,42 @@ async function main(): Promise<void> {
   // ── 6. Load reconciled active observations, restricted to fresh delta ───────────
   // Keep the genuine PersistedObservation[] for computation; project only for reporting.
   let freshPersistedObs: PersistedObservation[] = [];
-  const freshDeltaObs = await step(6, "load fresh-delta observations", async () => {
+  await step(6, "load fresh-delta observations", async () => {
     const allObs = await store.listActiveObservations(pb.id);
     // Keep ONLY observations whose Alepes observation ID is in the fresh delta
     freshPersistedObs = allObs.filter((o) => freshDeltaObservationIds.has(String(o.id)));
-    return {
-      count: freshPersistedObs.length,
-      observations: freshPersistedObs.map((o) => ({
-        id: o.id,
-        observationIdFingerprint: fp(String(o.id)),
-        direction: o.direction,
-        status: o.status,
-        amountCents: o.amountCents,
-        description: o.description,
-        qualificationBalanceCents: o.qualificationBalanceCents,
-        firstObservedAt: o.firstObservedAt,
-        postedAt: o.postedAt,
-        predecessorObservationId: o.predecessorObservationId,
-        lastReconciledCycleId: o.lastReconciledCycleId,
-      })),
-    };
+    return { count: freshPersistedObs.length };
   });
 
   // Emit full lifecycle for each fresh-delta observation
-  for (const o of freshDeltaObs.observations) {
-    await recordObservationReceived(auditPorts, ctx, o.id, o.observationIdFingerprint, o.direction, o.amountCents as Cents, o.status === "posted");
+  for (const o of freshPersistedObs) {
+    // AUDIT SEMANTICS: externalRefFingerprint is the provider's transaction id
+    // fingerprinted; the Alepes id is handed only to the observation identity
+    // field, never to the external-ref fingerprint slot.
+    const extRefFp = o.externalRef ? fp(String(o.externalRef)) : fp(String(o.id));
+    await recordObservationReceived(auditPorts, ctx, o.id, extRefFp, o.direction, o.amountCents as Cents, o.status === "posted");
     await recordObservationNormalized(auditPorts, ctx, o.id, "plaid-sign-convention@1");
     await recordObservationPersisted(auditPorts, ctx, o.id, o.id);
   }
+
+  // ── 6b. Reporting projection (audit/UI only, derived — never used for logic) ──
+  const freshDeltaObs = {
+    count: freshPersistedObs.length,
+    observations: freshPersistedObs.map((o) => ({
+      id: o.id,
+      observationIdFingerprint: fp(String(o.id)),
+      externalRefFingerprint: o.externalRef ? fp(String(o.externalRef)) : null,
+      direction: o.direction,
+      status: o.status,
+      amountCents: o.amountCents,
+      description: o.description,
+      qualificationBalanceCents: o.qualificationBalanceCents,
+      firstObservedAt: o.firstObservedAt,
+      postedAt: o.postedAt,
+      predecessorObservationId: o.predecessorObservationId,
+      lastReconciledCycleId: o.lastReconciledCycleId,
+    })),
+  };
 
   // ── 7. Derive qualifying CashEvents (from fresh delta ONLY) ──────────────────
   const cashEvents = await step(7, "derive qualifying CashEvents from fresh delta", async () => {
@@ -457,8 +472,22 @@ async function main(): Promise<void> {
     throw new Error("no qualifying live event observed in sync delta");
   }
 
-  // ── 8. Shadow Mode end-to-end ───────────────────────────────────────────────
-  // Build a minimal portfolio for allocation (AAA/BBB 50/50)
+  // MILESTONE 5.4: independent recomputation proof. Build CapitalPlan +
+  // AllocationPlan from first principles using the pure engines, and require
+  // byte-identical canonical-hash equality with whatever runShadowMode produced.
+  // If the harness or runShadowMode is corrupted, this catches it deterministically.
+  const rule = {
+    id: "r-live-cert",
+    name: "Live certification rule",
+    trigger: "any_deposit" as never,
+    reserveBalance: nonNegativeCents(0),
+    action: "invest_percentage" as never,
+    amount: 50,
+    portfolioId: "p1",
+    active: true,
+    order: 0,
+  } as never;
+
   const portfolioState = {
     portfolio: {
       id: "p1",
@@ -476,23 +505,106 @@ async function main(): Promise<void> {
     totalValue: nonNegativeCents(100_000),
   };
 
-  const rule = {
-    id: "r-live-cert",
-    name: "Live certification rule",
-    trigger: "any_deposit" as never,
-    reserveBalance: nonNegativeCents(0),
-    action: "invest_percentage" as never,
-    amount: 50,
-    portfolioId: "p1",
-    active: true,
-    order: 0,
-  } as never;
+  const recomputation = await step(7.5, "independent recomputation (byte-identical CapitalPlan/AllocationPlan)", async () => {
+    const cashEvent = cashEvents.events[0] as unknown as CashEvent;
+    if (!cashEvent) throw new Error("missing CashEvent for recomputation");
+    // Pure-engine recomputation
+    const ruleResult = evaluateRules([rule] as never, cashEvent);
+    const expectedCapitalPlan = toCapitalPlan(cashEvent, ruleResult);
+    const expectedAllocationPlan = allocate(portfolioState as never, expectedCapitalPlan);
+    const expectedHash = await canonicalPlanHash({ capitalPlan: expectedCapitalPlan, allocationPlan: expectedAllocationPlan });
+    return { expectedCapitalPlan, expectedAllocationPlan, expectedHash };
+  });
+
+  // ── 8. Shadow Mode end-to-end ───────────────────────────────────────────────
 
   const shadow = await step(8, "Shadow Mode: real live deposit → shadow decision", async () => {
     // runShadowMode re-applies qualification internally — pass the authoritative list.
     const decisions = runShadowMode(freshPersistedObs, { rules: [rule], portfolioState });
     const decision = decisions[0];
     if (!decision) throw new Error("no shadow decision produced");
+
+    // MILESTONE 5.4 check: runShadowMode's plan must byte-identically match the
+    // independent recomputation from step 7.5, canonical hash equality.
+    const actualHash = await canonicalPlanHash({ capitalPlan: decision.plan.capitalPlan, allocationPlan: decision.plan.allocationPlan });
+    if (actualHash !== recomputation.expectedHash) {
+      throw new Error(
+        `MILESTONE 5.4 recomputation mismatch: expected canonicalHash=${recomputation.expectedHash}, runShadowMode produced ${actualHash}`
+      );
+    }
+
+    // MILESTONE 5.5: persist the Shadow ExecutionPlan + orders + audit + outbox atomically.
+    const pgPorts = createPostgresPorts({ connectionString: pgUrl });
+    const planId = `ep_${ulid()}` as PersistenceId;
+    const cashEventIdFp = decision.plan.cashEvent.id as PersistenceId;
+    const portfolioVersionId = `pv_${ulid()}` as PersistenceId;
+    const ruleVersionId = `rv_${ulid()}` as PersistenceId;
+
+    const snapshotHash = await inputSnapshotHash(
+      decision.plan.cashEvent,
+      [rule] as never,
+      portfolioState as never
+    );
+    const calcVersion = "rules-engine@1/allocation-engine@1";
+
+    const persistedPlanId = await pgPorts.execution.savePlan({
+      id: planId,
+      plan: decision.plan,
+      cashEventId: cashEventIdFp,
+      portfolioId: "p1",
+      ruleVersionId,
+      portfolioVersionId,
+      userId: undefined,
+      calculationVersion: calcVersion,
+      inputSnapshotHash: snapshotHash,
+      deployableCents: decision.plan.capitalPlan.deployable,
+      disposition: "shadow",
+    });
+
+    // Read-back: prove plan, orders, plan_created event, and outbox row exist.
+    const loadBack = await pgPorts.execution.loadPlan(persistedPlanId);
+    if (!loadBack) throw new Error("persisted plan could not be re-loaded");
+    if (loadBack.inputSnapshotHash !== snapshotHash) throw new Error("read-back inputSnapshotHash mismatch");
+    if (loadBack.calculationVersion !== calcVersion) throw new Error("read-back calculationVersion mismatch");
+    if (loadBack.disposition !== "shadow") throw new Error(`read-back disposition must be shadow; got ${loadBack.disposition}`);
+    const ordersBack = await pgPorts.execution.loadOrders(persistedPlanId);
+    if (ordersBack.length !== decision.plan.orders.length) {
+      throw new Error(`orders read-back mismatch: expected ${decision.plan.orders.length}, got ${ordersBack.length}`);
+    }
+
+    // Prove the ExecutionPlanCreated outbox row exists and is pending delivery.
+    // Use RAW SQL via a throwaway pg client — do NOT call claimPending/markPublished,
+    // because those mutate the row. The Temporal outboxPublisherWorkflow is the
+    // only legal consumer that marks an outbox event delivered.
+    const rawClient = new pg.Client({ connectionString: pgUrl });
+    let executionPlanCreatedOutboxId: string | null = null;
+    try {
+      await rawClient.connect();
+      const outboxRow = await rawClient.query<{
+        id: string; type: string; payload: Record<string, unknown>; delivered_at: unknown; claimed_at: unknown;
+      }>(
+        `SELECT id, type, payload, delivered_at, claimed_at FROM outbox
+          WHERE type = 'ExecutionPlanCreated' AND (payload->>'planId') = $1
+          ORDER BY created_at DESC LIMIT 1`,
+        [persistedPlanId]
+      );
+      if (outboxRow.rows.length !== 1) {
+        throw new Error(`expected exactly one ExecutionPlanCreated outbox row for planId=${persistedPlanId}, got ${outboxRow.rows.length}`);
+      }
+      const row = outboxRow.rows[0];
+      if (row.delivered_at !== null || row.claimed_at !== null) {
+        throw new Error("expected outbox row to be undelivered and unclaimed");
+      }
+      const mode = (row.payload as { executionMode?: unknown }).executionMode;
+      if (mode !== "shadow") {
+        throw new Error(`outbox executionMode must be "shadow"; got ${JSON.stringify(mode)}`);
+      }
+      executionPlanCreatedOutboxId = row.id;
+    } finally {
+      await rawClient.end();
+    }
+
+    await pgPorts.close();
 
     // Record rule evaluation — use event.id which IS the durable CashEvent/FinancialObservation id
     await recordRuleEvaluated(auditPorts, ctx, "r-live-cert", decision.plan.cashEvent.id, decision.plan.capitalPlan.deployable);
@@ -522,9 +634,12 @@ async function main(): Promise<void> {
       deployableCents: deployable,
       totalDeployedCents: totalDeployed,
       cashEventIdFingerprint: fp(decision.plan.cashEvent.id),
+      persistedPlanId,
+      persistedOutboxEventId: executionPlanCreatedOutboxId,
       proposedOrderCount: decision.plan.orders.length,
       sourceDescription: decision.plan.cashEvent.description,
       nonExecuting: true,
+      recomputationHash: recomputation.expectedHash,
     };
   });
 

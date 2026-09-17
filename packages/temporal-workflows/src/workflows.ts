@@ -1,4 +1,5 @@
 import { proxyActivities, sleep } from "@temporalio/workflow";
+import { parseExecutionPlanCreatedPayload } from "./types";
 import type {
   AppendEventInput,
   ExecutionOptions,
@@ -185,14 +186,21 @@ export async function executionPlanWorkflow(
     }
   }
 
-  // 4) Mark executed
-  await updateDisposition({ planId, disposition: "executed" });
+  // 4) Mark terminal disposition correctly for the mode.
+  // Shadow: plan is completed simulatively — disposition stays "shadow" forever;
+  //    "executed" is reserved for plans that actually submitted orders to a
+  //    provider. Elsewhere, "executed" means real execution.
+  // Real: executed (orders were submitted and reconciled).
+  const finalDisposition = opts.shadow ? ("shadow" as const) : ("executed" as const);
+  await updateDisposition({ planId, disposition: finalDisposition });
   await appendEvent({
     planId,
     eventId: `${workflowId}:completed`,
     stage: "execution.completed",
-    summary: `Execution ${opts.shadow ? "(shadow)" : ""} completed`,
-    detail: `filledCents=${filledCents} workflow=${workflowId}`,
+    summary: opts.shadow ? `Shadow run completed` : `Execution completed`,
+    detail: opts.shadow
+      ? `Shadow fills simulated. filledCents=${filledCents} workflow=${workflowId}`
+      : `filledCents=${filledCents} workflow=${workflowId}`,
     amountCents: filledCents,
   });
 
@@ -229,25 +237,25 @@ export async function outboxPublisherWorkflow(
 
     for (const claim of claims) {
       if (claim.type === "ExecutionPlanCreated") {
-        const payload = claim.payload as {
-          planId?: unknown;
-          shadow?: unknown;
-          inputSnapshotHash?: unknown;
-          calculationVersion?: unknown;
-        };
-        const planId = String(payload.planId);
-        const shadow = Boolean(payload.shadow);
+        // SECURITY: never default missing/unknown mode to execute. Parse throw
+        // is fail-closed — Temporal retries the workflow and marks the run
+        // failed rather than executing money on the basis of a missing flag.
+        const parsed = parseExecutionPlanCreatedPayload(claim.payload);
+        if (parsed.executionMode !== "shadow" && parsed.executionMode !== "execute") {
+          // parse already enforces this; unreachable defensive check for defense in depth
+          throw new Error(`unreachable: invalid executionMode`);
+        }
+        const shadow = parsed.executionMode === "shadow";
         // Forward independent expected provenance only when both fields are
         // present; otherwise the workflow falls back to self-verification.
         const expected: ExpectedProvenance | undefined =
-          typeof payload.inputSnapshotHash === "string" &&
-          typeof payload.calculationVersion === "string"
+          parsed.inputSnapshotHash !== undefined && parsed.calculationVersion !== undefined
             ? {
-                inputSnapshotHash: payload.inputSnapshotHash,
-                calculationVersion: payload.calculationVersion,
+                inputSnapshotHash: parsed.inputSnapshotHash,
+                calculationVersion: parsed.calculationVersion,
               }
             : undefined;
-        await executionPlanWorkflow(planId, { shadow }, expected, claim.id);
+        await executionPlanWorkflow(parsed.planId, { shadow }, expected, claim.id);
       } else {
         // Unknown event type: release so it doesn't block the queue
         await releaseOutboxClaim({ id: claim.id });

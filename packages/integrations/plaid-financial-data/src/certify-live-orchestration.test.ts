@@ -282,15 +282,20 @@ async function runCertificationOrchestration(inputs: OrchestrationInputs): Promi
   const allObs = await store.listActiveObservations("binding-1" as AccountBindingId);
   const freshObs = allObs.filter((o) => freshDeltaObservationIds.has(o.id));
 
-  // Emit lifecycle for fresh observations
+  // Emit lifecycle for fresh observations — externalRef is asserted to exist on
+  // every persistence-read PersistedObservation; it is what gets fingerprinted
+  // here (NOT the Alepes id) so audit/ref provenance matches actual provider txns.
   for (const o of freshObs) {
-    await recordObservationReceived(auditPorts, ctx, o.id, `fp-${o.id}`, o.direction, o.amountCents as any, o.status === "posted");
+    const extRefFp = o.externalRef ? `fp-${o.externalRef}` : `fp-${o.id}`;
+    await recordObservationReceived(auditPorts, ctx, o.id, extRefFp, o.direction, cents(o.amountCents), o.status === "posted");
     await recordObservationNormalized(auditPorts, ctx, o.id, "plaid-sign-convention@1");
     await recordObservationPersisted(auditPorts, ctx, o.id, o.id);
   }
 
-  // Derive qualifying CashEvents from fresh delta ONLY
-  const events = qualifyCashEvents(freshObs as any);
+  // Derive qualifying CashEvents from fresh delta ONLY — no casts at the
+  // persistence/domain boundary. qualifyCashEvents takes the real
+  // PersistedObservation shape, including `state`.
+  const events = qualifyCashEvents(freshObs);
 
   // Record qualified cash events
   for (const e of events) {
@@ -309,9 +314,8 @@ async function runCertificationOrchestration(inputs: OrchestrationInputs): Promi
     return { cashEvents: events, shadowDecision: null, gates: [{ gate: "qualifying_event", status: "FAIL", failureCode: "sync.no_qualifying_event" }], finalState: "dirty", result: "FAIL" };
   }
 
-  // Shadow Mode
-  const persistedObs = freshObs.filter((o) => o.status === "posted" && o.direction === "credit");
-  const decisions = runShadowMode(persistedObs as any, { rules: [makeRule()], portfolioState: makePortfolioState() });
+  // Shadow Mode — runShadowMode re-applies qualification; pass the authoritative list.
+  const decisions = runShadowMode(freshObs, { rules: [makeRule()], portfolioState: makePortfolioState() });
   const decision = decisions[0];
 
   if (!decision) {

@@ -130,6 +130,10 @@ class PostgresExecutionRepository {
           "ExecutionPlanCreated",
           JSON.stringify({
             planId: persistedPlanId,
+            // SECURITY: explicit mode, never defaulted. A plan only begins the
+            // workflow consume cycle if its declared mode is one of the two
+            // typed values.
+            executionMode: input.disposition === "shadow" ? "shadow" : "execute",
             // Independent expected provenance — the publisher passes these into
             // the workflow so verifyPlan compares the freshly-loaded persisted
             // row against this canonical identity, not against itself.

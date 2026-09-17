@@ -19,7 +19,8 @@
   - PR text, descriptions, or comments
   - Screenshots, terminal output, or artifacts
   - Command-line arguments (use env vars only)
-- **All live credentials** must be stored in GitHub Environment secrets (not repository secrets), restricted to the specific environment (e.g., `plaid-live`, `alpaca-live`).
+- **CI / hosted certifications use GitHub Environment secrets only** (e.g., `plaid-live`, `alpaca-live`), restricted per-environment. These must be the only copy in CI.
+- **Local developer certifications** may use a developer-workstation env file (e.g. `~/.config/alepes/plaid-production.env`, mode `0600`) on an encrypted-at-rest volume (macOS FileVault or equivalent verified preflight). This is the deliberately-authorized local path for human-driven certification; the file must not be checked in, must not contain any secret that is not also present in the GitHub Environment, and must be removed/rotated on suspicion of exposure.
 - **Secrets must be rotated** per provider policy or on any suspected exposure.
 
 ### 1.3 Data Minimization & Retention
@@ -43,8 +44,8 @@
 - Alepes receives only opaque `access_token`/`item_id` from Plaid Link — never the underlying credentials.
 
 ### 1.7 Execution Boundaries
-- **Live certification must remain Shadow-only**: zero transfers, zero brokerage orders, zero provider mutations.
-- The harness must assert `executeCount = 0`, `transferCount = 0`, `orderCount = 0`, `providerMutationCount = 0` as hard invariants.
+- **Live certification must remain Shadow-only**: zero transfers, zero brokerage orders **submitted at the provider**, zero provider mutations. Shadow may legitimately *propose* orders internally; the safety invariant is that nothing is executed.
+- The harness must assert `executedOrderCount = 0`, `transferCount = 0`, `providerMutationCount = 0` as hard invariants. `proposedOrderCount` is separately reported but may legitimately be greater than zero.
 
 ### 1.8 Test/Admin Surface Protection
 - **Authentication, authorization, rate limiting, and least privilege** applied to any test/admin surfaces exposed to live credentials.
@@ -69,7 +70,7 @@
 | Secrets never in code/artifacts | `.gitignore` (`.env*`, `*.pem`), TruffleHog secret scan | **Auto-enforced (repo)** |
 | Secrets only in GitHub Env secrets | Workflow `environment:` declaration; CI logs show `***` | **Auto-enforced (CI)** |
 | No bank credentials in Alepes | Architectural: Plaid Link only; harness receives only `access_token` | **Architectural (code)** |
-| Shadow-only disposition | Harness hard assertions (`executeCount = 0`, etc.) | **Runtime-enforced (existing harness inline guards)** |
+| Shadow-only disposition | Harness hard assertions (`executedOrderCount = 0`, etc.) | **Runtime-enforced (existing harness inline guards)** |
 | Redaction of all identifiers | `fp()` fingerprint + `redact()` in every harness | **Runtime-enforced (existing harness inline guards)** |
 | Environment guard (refuse wrong env) | `if (ENV !== "production") process.exit(2)` | **Runtime-enforced (existing harness inline guards)** |
 | Fail-closed on missing prerequisites | `process.exit(2)` with explicit message | **Runtime-enforced (existing harness inline guards)** |
@@ -107,7 +108,7 @@ import {
 - `createRedactor(secrets)` — returns a redactor that replaces every registered
   secret/identifier; safe on non-strings and idempotent.
 - `assertShadowOnly({...})` — asserts `disposition === "shadow"`, `shadowCount > 0`,
-  and `executeCount/transferCount/orderCount/providerMutationCount === 0`.
+  and `executedOrderCount/transferCount/providerMutationCount === 0`.
 
 The package is PURE (no React/Next/provider SDKs, no I/O) and unit-tested in
 `packages/certification-guards/src/index.test.ts`.

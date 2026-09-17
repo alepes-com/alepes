@@ -103,15 +103,15 @@ export interface ShadowOnlyInput {
   /** Number of shadow (non-executing) decisions produced. Must be > 0. */
   shadowCount: number;
   /** Number of real executions. Must be 0. */
-  executeCount: number;
+  executedOrderCount: number;
   /** Number of money transfers. Must be 0. */
   transferCount: number;
-  /** Number of brokerage orders. Must be 0. */
-  orderCount: number;
   /** Number of provider mutations. Must be 0. */
   providerMutationCount: number;
   /** The disposition kind. Must be "shadow". */
   disposition: string;
+  /** Number of orders PROPOSED by Shadow (may be > 0; never submitted). */
+  proposedOrderCount?: number;
 }
 
 /**
@@ -126,10 +126,8 @@ export function assertShadowOnly(a: ShadowOnlyInput): void {
   if (a.shadowCount <= 0) {
     throw new Error(`shadowCount=${a.shadowCount}, expected > 0`);
   }
-  if (a.executeCount !== 0) throw new Error(`executeCount=${a.executeCount}, expected 0`);
+  if (a.executedOrderCount !== 0) throw new Error(`executedOrderCount=${a.executedOrderCount}, expected 0`);
   if (a.transferCount !== 0) throw new Error(`transferCount=${a.transferCount}, expected 0`);
-  if (a.orderCount !== 0) throw new Error(`orderCount=${a.orderCount}, expected 0`);
-  if (a.providerMutationCount !== 0) {
-    throw new Error(`providerMutationCount=${a.providerMutationCount}, expected 0`);
-  }
+  if (a.providerMutationCount !== 0) throw new Error(`providerMutationCount=${a.providerMutationCount}, expected 0`);
+  // proposedOrderCount is informational only; no assertion.
 }

@@ -1,47 +1,20 @@
-// Regression guards for the fail-closed baseline checkpoint path.
+// Regression guards for the fail-closed sync store construction.
+// Baseline-checkpoint manual persistence has been REMOVED — a reconciled
+// cursor must be produced by reconcileSyncCycle (which also writes the
+// accompanying observation/event rows). No caller should be able to mint a
+// "reconciled" checkpoint without a corresponding reconciliation transaction.
 // These are UNIT TESTS — no real DB required. They must always run under `bun run test`.
 
 import { describe, it, expect } from "vitest";
-import { createSyncPostgresStore, persistBaselineCheckpoint, cursorFingerprint } from "./index";
+import { createSyncPostgresStore, cursorFingerprint } from "./index";
 
-describe("baseline guards — fail-closed persistence (unit, no DB)", () => {
+describe("sync store construction + cursor fingerprint — fail-closed guards (unit, no DB)", () => {
   it("createSyncPostgresStore rejects empty connectionString", () => {
     expect(() => createSyncPostgresStore({ connectionString: "" })).toThrow(/non-empty/);
   });
 
   it("createSyncPostgresStore rejects whitespace-only connectionString", () => {
     expect(() => createSyncPostgresStore({ connectionString: "   " })).toThrow(/non-empty/);
-  });
-
-  it("persistBaselineCheckpoint rejects empty connectionString before any DB contact", async () => {
-    await expect(
-      persistBaselineCheckpoint("", {
-        accountBindingId: "b1" as any,
-        cursor: "test-cursor",
-        status: "reconciled",
-      })
-    ).rejects.toThrow(/non-empty/);
-  });
-
-  it("persistBaselineCheckpoint rejects whitespace-only connectionString", async () => {
-    await expect(
-      persistBaselineCheckpoint("   ", {
-        accountBindingId: "b1" as any,
-        cursor: "test-cursor",
-        status: "reconciled",
-      })
-    ).rejects.toThrow(/non-empty/);
-  });
-
-  it("persistBaselineCheckpoint rejects on write failure (nonexistent DB) and never returns persisted:true", async () => {
-    // Use a connection string that will fail to connect / write
-    await expect(
-      persistBaselineCheckpoint("postgresql://user@localhost:1/nonexistent", {
-        accountBindingId: "b1" as any,
-        cursor: "test-cursor",
-        status: "reconciled",
-      })
-    ).rejects.toThrow(); // rejects, does not resolve with { persisted: true }
   });
 
   it("cursorFingerprint is deterministic and length-stable", () => {
@@ -51,7 +24,6 @@ describe("baseline guards — fail-closed persistence (unit, no DB)", () => {
     expect(fp1).toBe(fp2);
     // Format: fp-<16 hex chars>-len<length>
     expect(fp1).toMatch(/^fp-[0-9a-f]{16}-len\d+$/);
-    // Length encoded matches actual cursor length
     const lenMatch = fp1.match(/len(\d+)$/);
     expect(lenMatch).toBeTruthy();
     expect(Number(lenMatch![1])).toBe(c.length);
