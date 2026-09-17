@@ -31,6 +31,7 @@ export interface WorkerOptions {
 import {
   appendEvent,
   claimOutbox,
+  claimOutboxById,
   executeOrders,
   loadPlan,
   markOutboxDelivered,
@@ -69,6 +70,7 @@ export async function startWorker(opts: WorkerOptions): Promise<Worker> {
       executeOrders,
       reconcileExecution,
       claimOutbox,
+      claimOutboxById,
       markOutboxDelivered,
       releaseOutboxClaim,
     },

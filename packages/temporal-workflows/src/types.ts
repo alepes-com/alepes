@@ -36,6 +36,13 @@ export interface OrderLine {
 export interface LoadPlanOutput {
   provenance: PersistedProvenance;
   orders: OrderLine[];
+  /**
+   * The execution mode declared when the plan row was persisted. The
+   * workflow cross-checks this against `opts.shadow` and throws on any
+   * mismatch, so a direct caller (`{shadow:false}`) can NEVER silently turn
+   * a plan persisted as `execution_mode = 'shadow'` into a real-money run.
+   */
+  executionMode: "shadow" | "execute";
 }
 
 export interface VerifyPlanInput {
@@ -60,6 +67,7 @@ export interface AppendEventInput {
     | "execution.started"
     | "order.submitted"
     | "order.filled"
+    | "shadow.order.filled"
     | "execution.completed"
     | "execution.failed";
   summary: string;
@@ -143,9 +151,15 @@ export interface ExecutionPlanCreatedPayload {
   planId: string;
   /** REQUIRED. "shadow" = simulate only; "execute" = actually submit orders. */
   executionMode: ExecutionPlanOutboxMode;
-  /** Provenance: allows consumers to call verifyPlan against these values. */
-  inputSnapshotHash?: string;
-  calculationVersion?: string;
+  /**
+   * REQUIRED. Independent provenance for outbox-driven consumers. Must be a
+   * non-empty string. The publisher forwards these to the workflow as the
+   * independent `ExpectedProvenance`; the workflow refuses to verify against
+   * the freshly-loaded row's own values. Direct (non-outbox) workflow
+   * invocation may pass `expected` explicitly; it may not omit it.
+   */
+  inputSnapshotHash: string;
+  calculationVersion: string;
 }
 
 /** Parse an unknown outbox payload into a typed ExecutionPlanCreatedPayload — fail-closed on any defect. */
@@ -164,8 +178,22 @@ export function parseExecutionPlanCreatedPayload(payload: unknown): ExecutionPla
       `ExecutionPlanCreated.executionMode must be "shadow" or "execute" (got: ${typeof mode === "string" ? JSON.stringify(mode) : typeof mode})`
     );
   }
-  const inputSnapshotHash = typeof p.inputSnapshotHash === "string" ? p.inputSnapshotHash : undefined;
-  const calculationVersion = typeof p.calculationVersion === "string" ? p.calculationVersion : undefined;
+  // Outbox-driven provenance is NON-NEGOTIABLE. Allowing it to be omitted
+  // and "falling back" to the freshly-loaded row's own values would let the
+  // event self-verify — which is precisely the laundering the outbox
+  // contract exists to prevent.
+  const inputSnapshotHash = p.inputSnapshotHash;
+  if (typeof inputSnapshotHash !== "string" || inputSnapshotHash.length === 0) {
+    throw new Error(
+      "ExecutionPlanCreated.inputSnapshotHash is required (non-empty string) for outbox-driven execution"
+    );
+  }
+  const calculationVersion = p.calculationVersion;
+  if (typeof calculationVersion !== "string" || calculationVersion.length === 0) {
+    throw new Error(
+      "ExecutionPlanCreated.calculationVersion is required (non-empty string) for outbox-driven execution"
+    );
+  }
   return { planId, executionMode: mode, inputSnapshotHash, calculationVersion };
 }
 

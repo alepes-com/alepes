@@ -58,6 +58,7 @@ function makePlan(input: {
   ruleVersionId: string;
   portfolioVersionId?: string;
   hash?: string;
+  executionMode?: "shadow" | "execute";
 }): PersistableExecutionPlan {
   return {
     id: `p_${ulid()}` as PersistenceId,
@@ -71,6 +72,7 @@ function makePlan(input: {
     inputSnapshotHash: input.hash ?? `fake-hash-for-${input.cashEventId}`,
     deployableCents: nonNegativeCents(600_00),
     disposition: "shadow",
+    executionMode: input.executionMode ?? "shadow",
   };
 }
 
@@ -212,8 +214,8 @@ runIntegration("persistence integration (real PostgreSQL)", () => {
 
       // Insert the plan
       await client.query(
-        `INSERT INTO ${PLANS} (id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        `INSERT INTO ${PLANS} (id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition, execution_mode)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
           plan.id,
           plan.userId,
@@ -225,6 +227,7 @@ runIntegration("persistence integration (real PostgreSQL)", () => {
           plan.inputSnapshotHash,
           plan.deployableCents,
           plan.disposition,
+          plan.executionMode,
         ]
       );
 

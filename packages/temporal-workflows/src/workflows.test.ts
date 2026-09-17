@@ -39,6 +39,7 @@ import {
   executeOrders,
   reconcileExecution,
   claimOutbox,
+  claimOutboxById,
   markOutboxDelivered,
   releaseOutboxClaim,
 } from "./activities";
@@ -106,6 +107,7 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
     cashEventId: string;
     deployableCents?: number;
     disposition?: string;
+    executionMode?: "shadow" | "execute";
   }): Promise<{ planId: string; calculationVersion: string; inputSnapshotHash: string }> {
     const id = `plan_${ulid()}`;
     const cv = calculationVersion();
@@ -152,6 +154,7 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
       inputSnapshotHash: hash,
       deployableCents: nonNegativeCents(overrides.deployableCents ?? 200_00),
       disposition: (overrides.disposition ?? "shadow") as PersistableDisposition,
+      executionMode: overrides.executionMode ?? "shadow",
     };
     const savedId = await ports.execution.savePlan(plan);
     return { planId: savedId, calculationVersion: cv, inputSnapshotHash: hash };
@@ -189,6 +192,7 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
         executeOrders,
         reconcileExecution,
         claimOutbox,
+        claimOutboxById,
         markOutboxDelivered,
         releaseOutboxClaim,
       },
@@ -198,6 +202,7 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
         const { planId, calculationVersion: cv, inputSnapshotHash: hash } = await savePlan({
           cashEventId: `ce_${ulid()}`,
           disposition: "executed",
+          executionMode: "execute",
         });
         const handle = await env.client.workflow.start("executionPlanWorkflow", {
           args: [planId, { shadow: false }, { inputSnapshotHash: hash, calculationVersion: cv }],
@@ -228,6 +233,7 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
         executeOrders,
         reconcileExecution,
         claimOutbox,
+        claimOutboxById,
         markOutboxDelivered,
         releaseOutboxClaim,
       },
@@ -268,13 +274,14 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
         executeOrders,
         reconcileExecution,
         claimOutbox,
+        claimOutboxById,
         markOutboxDelivered,
         releaseOutboxClaim,
       },
     });
     try {
       await worker.runUntil(async () => {
-        const { planId } = await savePlan({ cashEventId: `ce_${ulid()}` });
+        const { planId } = await savePlan({ cashEventId: `ce_${ulid()}`, executionMode: "execute" });
         const handle = await env.client.workflow.start("executionPlanWorkflow", {
           args: [
             planId,
@@ -310,6 +317,7 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
         executeOrders,
         reconcileExecution,
         claimOutbox,
+        claimOutboxById,
         markOutboxDelivered,
         releaseOutboxClaim,
       },
@@ -319,6 +327,7 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
         const { planId, calculationVersion: cv, inputSnapshotHash: hash } = await savePlan({
           cashEventId: `ce_${ulid()}`,
           disposition: "approved",
+          executionMode: "execute",
           deployableCents: 200_00,
         });
         const handle = await env.client.workflow.start("executionPlanWorkflow", {
@@ -392,6 +401,7 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
         executeOrders,
         reconcileExecution,
         claimOutbox,
+        claimOutboxById,
         markOutboxDelivered,
         releaseOutboxClaim,
       },
@@ -401,6 +411,7 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
         const { planId, calculationVersion: cv, inputSnapshotHash: hash } = await savePlan({
           cashEventId: `ce_${ulid()}`,
           disposition: "approved",
+          executionMode: "execute",
           deployableCents: 200_00,
         });
         const loaded = await loadPlan({ planId });
@@ -449,5 +460,293 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
 
     // And the deterministic workflow id is stable across deliveries.
     expect(executionWorkflowId(planId)).toBe(`execution-plan:${planId}`);
+  });
+
+  // ─── Spec case: caller/persisted execution-mode mismatch fails closed ──────
+  // A direct workflow invocation with `opts.shadow = false` against a plan
+  // persisted with execution_mode = 'shadow' must NOT silently escalate into
+  // a real provider call. The workflow throws BEFORE touching executeOrders.
+  it("executionPlanWorkflow: caller requests execute against a shadow plan → failed, no brokerage", async () => {
+    const env = await TestWorkflowEnvironment.createTimeSkipping();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: "alepes-test-modex",
+      workflowBundle: bundle,
+      activities: {
+        loadPlan,
+        verifyPlan,
+        appendEvent,
+        updateDisposition,
+        executeOrders,
+        reconcileExecution,
+        claimOutbox,
+        claimOutboxById,
+        markOutboxDelivered,
+        releaseOutboxClaim,
+      },
+    });
+    try {
+      await worker.runUntil(async () => {
+        const { planId, calculationVersion: cv, inputSnapshotHash: hash } = await savePlan({
+          cashEventId: `ce_${ulid()}`,
+          disposition: "shadow",
+          executionMode: "shadow",
+        });
+        const handle = await env.client.workflow.start("executionPlanWorkflow", {
+          args: [planId, { shadow: false }, { inputSnapshotHash: hash, calculationVersion: cv }],
+          taskQueue: "alepes-test-modex",
+          workflowId: executionWorkflowId(planId),
+        });
+        const result = await handle.result();
+        expect((result as { result: { kind: string } }).result.kind).toBe("failed");
+        expect(brokerCalls).toBe(0);
+        const loaded = await loadPlan({ planId });
+        expect(loaded.provenance.disposition).toBe("failed");
+      });
+    } finally {
+      await env.teardown();
+    }
+  });
+
+  // ─── Spec case: shadow-mode fills persist under shadow.order.filled ─────
+  // The durable audit must NEVER confuse a simulated shadow fill with a real
+  // provider fill. We prove the fills end up under the distinct kind.
+  it("shadow mode persists simulated fills under shadow.order.filled (never order.filled)", async () => {
+    const env = await TestWorkflowEnvironment.createTimeSkipping();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: "alepes-test-audit",
+      workflowBundle: bundle,
+      activities: {
+        loadPlan,
+        verifyPlan,
+        appendEvent,
+        updateDisposition,
+        executeOrders,
+        reconcileExecution,
+        claimOutbox,
+        claimOutboxById,
+        markOutboxDelivered,
+        releaseOutboxClaim,
+      },
+    });
+    try {
+      await worker.runUntil(async () => {
+        const { planId, calculationVersion: cv, inputSnapshotHash: hash } = await savePlan({
+          cashEventId: `ce_${ulid()}`,
+          disposition: "shadow",
+          executionMode: "shadow",
+        });
+        const handle = await env.client.workflow.start("executionPlanWorkflow", {
+          args: [planId, { shadow: true }, { inputSnapshotHash: hash, calculationVersion: cv }],
+          taskQueue: "alepes-test-audit",
+          workflowId: executionWorkflowId(planId),
+        });
+        const result = await handle.result();
+        expect((result as { result: { kind: string } }).result.kind).toBe("completed_shadow");
+        expect(brokerCalls).toBe(0);
+
+        const { Pool } = await import("pg");
+        const pool = new Pool({ connectionString: TEST_CONNECTION });
+        try {
+          const kinds = await pool.query<{ kind: string }>(
+            `SELECT DISTINCT kind FROM execution_plan_events WHERE execution_plan_id = $1`,
+            [planId]
+          );
+          const kindSet = new Set(kinds.rows.map((r) => r.kind));
+          // At minimum: plan.created, execution.started, shadow.order.filled, execution.completed.
+          expect(kindSet.has("shadow.order.filled")).toBe(true);
+          expect(kindSet.has("plan.created")).toBe(true);
+          expect(kindSet.has("execution.started")).toBe(true);
+          expect(kindSet.has("execution.completed")).toBe(true);
+          // The whole point of this fix: NO plain "order.filled" was written.
+          expect(kindSet.has("order.filled")).toBe(false);
+        } finally {
+          await pool.end();
+        }
+      });
+    } finally {
+      await env.teardown();
+    }
+  });
+
+  // ─── Bounded single-event publisher: proves PUBLISHED, not ENQUEUED ────
+  // The certification-safe path:
+  //   1) seed a SECOND unrelated pending ExecutionPlanCreated row;
+  //   2) drive ONLY the certification row through publishOutboxEventWorkflow;
+  //   3) assert that row's delivered_at is set and the unrelated row's is not;
+  //   4) assert brokerageCalls === 0, disposition remains "shadow";
+  //   5) assert a replay against the now-delivered row refuses to claim.
+  it("publishOutboxEventWorkflow: delivers the exact row, leaves unrelated pending rows alone", { timeout: 60_000 }, async () => {
+    const env = await TestWorkflowEnvironment.createTimeSkipping();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: "alepes-test-bounded-pub",
+      workflowBundle: bundle,
+      activities: {
+        loadPlan,
+        verifyPlan,
+        appendEvent,
+        updateDisposition,
+        executeOrders,
+        reconcileExecution,
+        claimOutbox,
+        claimOutboxById,
+        markOutboxDelivered,
+        releaseOutboxClaim,
+      },
+    });
+    try {
+      await worker.runUntil(async () => {
+        // The "real" certification plan
+        const target = await savePlan({
+          cashEventId: `ce_${ulid()}`,
+          disposition: "shadow",
+          executionMode: "shadow",
+        });
+        // An unrelated pending ExecutionPlanCreated event composed to resemble a
+        // stray earlier plan. The bounded publisher must NOT consume it.
+        const unrelated = await savePlan({
+          cashEventId: `ce_${ulid()}`,
+          disposition: "shadow",
+          executionMode: "shadow",
+        });
+
+        // Locate the two outbox rows by planId via raw SQL (mirrors the
+        // certification harness's lookup pattern).
+        const { Pool } = await import("pg");
+        const pool = new Pool({ connectionString: TEST_CONNECTION });
+        let targetOutboxId: string | null = null;
+        let unrelatedOutboxId: string | null = null;
+        try {
+          for (const [planId, setter] of [
+            [target.planId, (v: string) => (targetOutboxId = v)],
+            [unrelated.planId, (v: string) => (unrelatedOutboxId = v)],
+          ] as Array<[string, (v: string) => void]>) {
+            const r = await pool.query<{ id: string }>(
+              `SELECT id FROM outbox
+                WHERE type = 'ExecutionPlanCreated' AND payload->>'planId' = $1
+                ORDER BY created_at DESC LIMIT 1`,
+              [planId]
+            );
+            expect(r.rows).toHaveLength(1);
+            setter(r.rows[0].id);
+          }
+          expect(targetOutboxId).not.toBe(unrelatedOutboxId);
+
+          // Drive ONLY the target row through the bounded publisher.
+          const handle = await env.client.workflow.start("publishOutboxEventWorkflow", {
+            args: [targetOutboxId!, 30000],
+            taskQueue: "alepes-test-bounded-pub",
+            workflowId: `outbox-publish-once:${targetOutboxId}`,
+          });
+          const result = await handle.result();
+          expect((result as { published: boolean }).published).toBe(true);
+          expect((result as { planId: string }).planId).toBe(target.planId);
+
+          // Assert: target row IS delivered; unrelated row is NOT.
+          const targetRow = await pool.query<{ delivered_at: Date | null; claimed_at: Date | null }>(
+            `SELECT delivered_at, claimed_at FROM outbox WHERE id = $1`,
+            [targetOutboxId]
+          );
+          expect(targetRow.rows[0].delivered_at).not.toBeNull();
+
+          const unrelatedRow = await pool.query<{ delivered_at: Date | null; claimed_at: Date | null }>(
+            `SELECT delivered_at, claimed_at FROM outbox WHERE id = $1`,
+            [unrelatedOutboxId]
+          );
+          expect(unrelatedRow.rows[0].delivered_at).toBeNull();
+
+          // Disposition remains "shadow"; brokerage was never invoked.
+          const loaded = await loadPlan({ planId: target.planId });
+          expect(loaded.provenance.disposition).toBe("shadow");
+          expect(brokerCalls).toBe(0);
+
+          // Re-running the bounded publisher against the now-delivered row
+          // MUST refuse — claimPendingById throws on already-delivered rows.
+          // Temporal will mark this second run failed; the durable state remains.
+          const secondHandle = await env.client.workflow.start("publishOutboxEventWorkflow", {
+            args: [targetOutboxId!, 30000],
+            taskQueue: "alepes-test-bounded-pub",
+            workflowId: `outbox-publish-once:${targetOutboxId}-replay`,
+          });
+          await expect(secondHandle.result()).rejects.toThrow(/Workflow execution failed|already delivered|claimPendingById/);
+        } finally {
+          await pool.end();
+        }
+      });
+    } finally {
+      await env.teardown();
+    }
+  });
+
+  // ─── Bounded publisher on a TAMPERED payload: refuses to deliver ─────────
+  // Writes a syntactically-valid outbox row by hand whose payload is missing
+  // provenance. The bounded publisher must throw, and the harness must NEVER
+  // see delivered_at set on it.
+  it("publishOutboxEventWorkflow: tampered payload (missing provenance) never delivers", { timeout: 60_000 }, async () => {
+    const env = await TestWorkflowEnvironment.createTimeSkipping();
+    const worker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: "alepes-test-tampered",
+      workflowBundle: bundle,
+      activities: {
+        loadPlan,
+        verifyPlan,
+        appendEvent,
+        updateDisposition,
+        executeOrders,
+        reconcileExecution,
+        claimOutbox,
+        claimOutboxById,
+        markOutboxDelivered,
+        releaseOutboxClaim,
+      },
+    });
+    try {
+      await worker.runUntil(async () => {
+        const { planId } = await savePlan({
+          cashEventId: `ce_${ulid()}`,
+          disposition: "shadow",
+          executionMode: "shadow",
+        });
+
+        const { Pool } = await import("pg");
+        const pool = new Pool({ connectionString: TEST_CONNECTION });
+        let tamperedId: string | null = null;
+        try {
+          // Insert a tampered-by-hand outbox row mimicking a shadow plan but
+          // WITHOUT provenance. The bounded publisher must refuse.
+          const ins = await pool.query<{ id: string }>(
+            `INSERT INTO outbox (id, type, payload)
+             VALUES ($1, 'ExecutionPlanCreated', $2)
+             RETURNING id`,
+            [
+              `tampered_${ulid()}`,
+              JSON.stringify({ planId, executionMode: "shadow" }),
+            ]
+          );
+          tamperedId = ins.rows[0].id;
+
+          const handle = await env.client.workflow.start("publishOutboxEventWorkflow", {
+            args: [tamperedId, 30000],
+            taskQueue: "alepes-test-tampered",
+            workflowId: `outbox-publish-once:${tamperedId}`,
+          });
+          await expect(handle.result()).rejects.toThrow(/Workflow execution failed|inputSnapshotHash|calculationVersion/i);
+
+          const row = await pool.query<{ delivered_at: Date | null }>(
+            `SELECT delivered_at FROM outbox WHERE id = $1`,
+            [tamperedId]
+          );
+          expect(row.rows[0].delivered_at).toBeNull();
+          expect(brokerCalls).toBe(0);
+        } finally {
+          await pool.end();
+        }
+      });
+    } finally {
+      await env.teardown();
+    }
   });
 });

@@ -23,6 +23,8 @@
     "@alepes/audit": "*",
     "@alepes/persistence": "*",
     "@alepes/rules-engine": "*",
-    "@alepes/allocation-engine": "*"
+    "@alepes/allocation-engine": "*",
+    "@alepes/temporal-workflows": "*",
+    "@temporalio/client": "1.20.1"
   }
 }

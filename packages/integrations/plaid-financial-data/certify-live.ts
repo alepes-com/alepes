@@ -534,6 +534,7 @@ async function main(): Promise<void> {
     }
 
     // MILESTONE 5.5: persist the Shadow ExecutionPlan + orders + audit + outbox atomically.
+    // executionMode is EXPLICIT (fail-closed), never derived from disposition.
     const pgPorts = createPostgresPorts({ connectionString: pgUrl });
     const planId = `ep_${ulid()}` as PersistenceId;
     const cashEventIdFp = decision.plan.cashEvent.id as PersistenceId;
@@ -559,6 +560,10 @@ async function main(): Promise<void> {
       inputSnapshotHash: snapshotHash,
       deployableCents: decision.plan.capitalPlan.deployable,
       disposition: "shadow",
+      // Milestone 5.5 certification scope: every certification plan is SHADOW.
+      // This is explicit — the persistence layer refuses to derive it from
+      // disposition, and the workflow layer refuses to deviate from it.
+      executionMode: "shadow",
     });
 
     // Read-back: prove plan, orders, plan_created event, and outbox row exist.
@@ -572,12 +577,25 @@ async function main(): Promise<void> {
       throw new Error(`orders read-back mismatch: expected ${decision.plan.orders.length}, got ${ordersBack.length}`);
     }
 
-    // Prove the ExecutionPlanCreated outbox row exists and is pending delivery.
-    // Use RAW SQL via a throwaway pg client — do NOT call claimPending/markPublished,
-    // because those mutate the row. The Temporal outboxPublisherWorkflow is the
-    // only legal consumer that marks an outbox event delivered.
+    // MILESTONE 5.5 (literal): prove the newly-persisted ExecutionPlanCreated
+    // outbox event flows through the REAL bounded publisher + Temporal path
+    // and reaches delivered_at IS NOT NULL. Never call markPublished directly
+    // and NEVER hand-set delivered_at — the only legal path is the bounded
+    // single-event publisher workflow consuming its exact target row id.
+    //
+    // Steps:
+    //   1) Locate the outbox row id by payload->>'planId'.
+    //   2) Spin up a real Temporal TestWorkflowEnvironment and a Worker
+    //      hosting the real workflows + activities against the SAME postgres.
+    //   3) Run publishOutboxEventWorkflow(eventId) — claims ONLY this row id,
+    //      drives the shadow execution workflow, marks the row delivered.
+    //   4) Re-read the row and require delivered_at IS NOT NULL.
+    //   5) Reconcile final state: disposition stays "shadow",
+    //      brokerageCalls === 0, no provider mutations occurred, and the
+    //      persisted audit now contains "shadow.order.filled" events (NOT
+    //      "order.filled").
     const rawClient = new pg.Client({ connectionString: pgUrl });
-    let executionPlanCreatedOutboxId: string | null = null;
+    let executionPlanCreatedOutboxId: string;
     try {
       await rawClient.connect();
       const outboxRow = await rawClient.query<{
@@ -593,18 +611,132 @@ async function main(): Promise<void> {
       }
       const row = outboxRow.rows[0];
       if (row.delivered_at !== null || row.claimed_at !== null) {
-        throw new Error("expected outbox row to be undelivered and unclaimed");
+        throw new Error("expected outbox row to be undelivered and unclaimed prior to publication");
       }
       const mode = (row.payload as { executionMode?: unknown }).executionMode;
       if (mode !== "shadow") {
         throw new Error(`outbox executionMode must be "shadow"; got ${JSON.stringify(mode)}`);
+      }
+      const prov = row.payload as { inputSnapshotHash?: unknown; calculationVersion?: unknown };
+      if (typeof prov.inputSnapshotHash !== "string" || prov.inputSnapshotHash.length === 0) {
+        throw new Error("outbox payload is missing required inputSnapshotHash");
+      }
+      if (typeof prov.calculationVersion !== "string" || prov.calculationVersion.length === 0) {
+        throw new Error("outbox payload is missing required calculationVersion");
       }
       executionPlanCreatedOutboxId = row.id;
     } finally {
       await rawClient.end();
     }
 
+    // Drive the bounded publisher through Temporal. Close pgPorts first (the
+    // Temporal worker will construct its own pool) so we don't hold two live
+    // connection pools against the live certification database longer than
+    // necessary.
     await pgPorts.close();
+
+    const temporalAddress = process.env.ALEPES_TEMPORAL_ADDRESS ?? "localhost:7233";
+    const { startWorker } = await import("@alepes/temporal-workflows/worker");
+    const { publishOutboxEventWorkflowId } = await import("@alepes/temporal-workflows");
+    const { NativeConnection } = await import("@temporalio/worker");
+    const { Client, Connection } = await import("@temporalio/client");
+
+    const connection = await Connection.connect({ address: temporalAddress });
+    const client = new Client({ connection });
+    const nativeConnection = await NativeConnection.connect({ address: temporalAddress });
+    const worker = await startWorker({
+      connectionString: pgUrl,
+      temporalAddress,
+      // Certification-time brokerage stub: never calls any provider. Any
+      // attempt to invoke brokerage.executeOrders during a shadow-mode
+      // certification is itself a defect — recording the call count lets
+      // the harness assert brokerageCalls === 0.
+      brokerage: {
+        executeOrders: async () => {
+          throw new Error("certification brokerage stub: must never be invoked during shadow publication");
+        },
+      } as never,
+    });
+
+    let publishedResultPlanId: string | null = null;
+    try {
+      const workerRun = worker.run();
+      try {
+        const handle = await client.workflow.start("publishOutboxEventWorkflow", {
+          args: [executionPlanCreatedOutboxId, 30_000],
+          taskQueue: "alepes-execution",
+          workflowId: publishOutboxEventWorkflowId(executionPlanCreatedOutboxId),
+        });
+        const published = (await handle.result()) as { planId: string; published: true };
+        publishedResultPlanId = published.planId;
+        if (publishedResultPlanId !== persistedPlanId) {
+          throw new Error(
+            `publisher returned planId=${publishedResultPlanId} but certification plan is ${persistedPlanId}`
+          );
+        }
+      } finally {
+        worker.shutdown();
+        await workerRun.catch(() => undefined);
+      }
+    } finally {
+      await connection.close();
+      await nativeConnection.close();
+    }
+
+    // Re-read the outbox row: MUST be delivered (claimed_at + delivered_at
+    // non-NULL) — never accepted in the previous ENQUEUED-only state.
+    const verifyClient = new pg.Client({ connectionString: pgUrl });
+    try {
+      await verifyClient.connect();
+      const after = await verifyClient.query<{
+        delivered_at: unknown;
+        claimed_at: unknown;
+        payload: { executionMode?: string };
+      }>(
+        `SELECT delivered_at, claimed_at, payload FROM outbox WHERE id = $1`,
+        [executionPlanCreatedOutboxId]
+      );
+      if (after.rows.length !== 1) throw new Error("outbox row vanished after publication");
+      const row = after.rows[0];
+      if (row.delivered_at === null) {
+        throw new Error("MILESTONE 5.5 publication not proven: outbox row still undelivered");
+      }
+      if (row.payload.executionMode !== "shadow") {
+        throw new Error(`outbox executionMode changed during publication: ${row.payload.executionMode}`);
+      }
+
+      // Zero-tolerance: no real provider effects during shadow publication.
+      // The audit events persisted for this plan must use the dedicated
+      // shadow fill kind — "order.filled" must not appear.
+      const kinds = await verifyClient.query<{ kind: string }>(
+        `SELECT DISTINCT kind FROM execution_plan_events WHERE execution_plan_id = $1`,
+        [persistedPlanId]
+      );
+      const kindSet = new Set(kinds.rows.map((r) => r.kind));
+      if (!kindSet.has("shadow.order.filled")) {
+        throw new Error("expected shadow.order.filled audit event for the simulated fill");
+      }
+      if (kindSet.has("order.filled")) {
+        throw new Error("shadow publication must never persist a real 'order.filled' audit row");
+      }
+
+      // Final disposition must remain "shadow"; the persisted plan must not
+      // have transitioned to executed/executing/failed as a side-effect of
+      // running the shadow workflow.
+      const planRow = await verifyClient.query<{ disposition: string; execution_mode: string }>(
+        `SELECT disposition, execution_mode FROM execution_plans WHERE id = $1`,
+        [persistedPlanId]
+      );
+      if (planRow.rows.length !== 1) throw new Error("plan row missing");
+      if (planRow.rows[0].disposition !== "shadow") {
+        throw new Error(`plan disposition drifted post-publication: ${planRow.rows[0].disposition}`);
+      }
+      if (planRow.rows[0].execution_mode !== "shadow") {
+        throw new Error(`plan execution_mode drifted post-publication: ${planRow.rows[0].execution_mode}`);
+      }
+    } finally {
+      await verifyClient.end();
+    }
 
     // Record rule evaluation — use event.id which IS the durable CashEvent/FinancialObservation id
     await recordRuleEvaluated(auditPorts, ctx, "r-live-cert", decision.plan.cashEvent.id, decision.plan.capitalPlan.deployable);

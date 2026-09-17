@@ -26,6 +26,7 @@ function mapAuditStageToKind(stage: string): string {
     case "execution_started": return "execution.started";
     case "order_submitted": return "order.submitted";
     case "order_filled": return "order.filled";
+    case "shadow_order_filled": return "shadow.order.filled";
     case "execution_completed": return "execution.completed";
     case "execution_failed": return "execution.failed";
     default: return stage;
@@ -51,13 +52,30 @@ class PostgresExecutionRepository {
   constructor(private pool: Pool) {}
 
   async savePlan(input: PersistableExecutionPlan): Promise<PersistenceId> {
+    // SECURITY: fail-closed validation BEFORE the DB transaction so an
+    // unsupported executionMode can never sit inside a committed plans row.
+    // We do not derive this from `disposition`; a previous version mapped any
+    // non-shadow lifecycle state (rejected, failed, approval_required, ...)
+    // to "execute" which is not fail-closed.
+    if (input.executionMode !== "shadow" && input.executionMode !== "execute") {
+      throw new Error(
+        `savePlan: executionMode must be explicitly "shadow" or "execute" (got: ${JSON.stringify(input.executionMode)})`
+      );
+    }
+    if (typeof input.inputSnapshotHash !== "string" || input.inputSnapshotHash.length === 0) {
+      throw new Error(`savePlan: inputSnapshotHash must be a non-empty string`);
+    }
+    if (typeof input.calculationVersion !== "string" || input.calculationVersion.length === 0) {
+      throw new Error(`savePlan: calculationVersion must be a non-empty string`);
+    }
+
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
 
       const insert = await client.query<{ id: string }>(
-        `INSERT INTO ${TABLE_PLANS} (id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition, plan_data)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        `INSERT INTO ${TABLE_PLANS} (id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition, execution_mode, plan_data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (cash_event_id) DO NOTHING
          RETURNING id`,
         [
@@ -71,6 +89,7 @@ class PostgresExecutionRepository {
           input.inputSnapshotHash,
           input.deployableCents as number,
           input.disposition,
+          input.executionMode, // authoritative - never derived from disposition
           JSON.stringify(input.plan ?? null),
         ]
       );
@@ -130,13 +149,13 @@ class PostgresExecutionRepository {
           "ExecutionPlanCreated",
           JSON.stringify({
             planId: persistedPlanId,
-            // SECURITY: explicit mode, never defaulted. A plan only begins the
-            // workflow consume cycle if its declared mode is one of the two
-            // typed values.
-            executionMode: input.disposition === "shadow" ? "shadow" : "execute",
-            // Independent expected provenance — the publisher passes these into
-            // the workflow so verifyPlan compares the freshly-loaded persisted
-            // row against this canonical identity, not against itself.
+            // Explicit and authoritative: the producer's declared execution
+            // authorization, not derived from `disposition`, never defaulted.
+            // A consumer that cannot satisfy this contract MUST throw.
+            executionMode: input.executionMode,
+            // REQUIRED provenance — never optional. The publisher forwards
+            // this as the independent `ExpectedProvenance` so the workflow
+            // verifies the freshly-loaded row against an external anchor.
             inputSnapshotHash: input.inputSnapshotHash,
             calculationVersion: input.calculationVersion,
           }),
@@ -155,7 +174,7 @@ class PostgresExecutionRepository {
 
   async loadPlan(id: PersistenceId): Promise<PersistableExecutionPlan | null> {
     const res = await this.pool.query(
-      `SELECT id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition, plan_data
+      `SELECT id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition, execution_mode, plan_data
        FROM ${TABLE_PLANS} WHERE id = $1`,
       [id]
     );
@@ -176,6 +195,7 @@ class PostgresExecutionRepository {
           : row.deployable_cents
       ),
       disposition: row.disposition as PersistableDisposition,
+      executionMode: row.execution_mode as PersistableExecutionPlan["executionMode"],
       plan: (row.plan_data ?? undefined) as PersistableExecutionPlan["plan"],
     };
   }
@@ -281,6 +301,59 @@ class PostgresOutboxRepository {
         claimExpiresAt: r.claim_expires_at,
         attempts: r.attempts,
       }));
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async claimPendingById(id: PersistenceId, leaseMs: number): Promise<OutboxClaim> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Bounded single-row claim: must be pending, not currently leased, and
+      // not delivered. We deliberately do NOT skip locked here — if another
+      // worker holds this specific row the certification must fail loudly
+      // rather than silently claim nothing.
+      const sel = await client.query<{ id: string; type: string; payload: Record<string, unknown>; delivered_at: Date | null }>(
+        `SELECT id, type, payload, delivered_at
+           FROM ${TABLE_OUTBOX}
+          WHERE id = $1
+          FOR UPDATE`,
+        [id]
+      );
+      if (sel.rows.length === 0) {
+        throw new Error(`claimPendingById: outbox row not found (id=${id})`);
+      }
+      const row = sel.rows[0];
+      if (row.delivered_at !== null) {
+        throw new Error(`claimPendingById: row ${id} is already delivered; refusing to re-deliver`);
+      }
+      const upd = await client.query<{ id: string; type: string; payload: Record<string, unknown>; claim_expires_at: Date; attempts: number }>(
+        `UPDATE ${TABLE_OUTBOX}
+            SET claimed_at = now(),
+                claim_expires_at = now() + ($2 || ' milliseconds')::interval,
+                attempts = attempts + 1
+          WHERE id = $1
+            AND delivered_at IS NULL
+            AND (claimed_at IS NULL OR claim_expires_at < now())
+          RETURNING id, type, payload, claim_expires_at, attempts`,
+        [id, String(leaseMs)]
+      );
+      if (upd.rows.length !== 1) {
+        throw new Error(`claimPendingById: row ${id} is currently claimed under a non-expired lease`);
+      }
+      await client.query("COMMIT");
+      const r = upd.rows[0];
+      return {
+        id: r.id as PersistenceId,
+        type: r.type,
+        payload: r.payload,
+        claimExpiresAt: r.claim_expires_at?.toISOString?.() ?? null,
+        attempts: r.attempts,
+      };
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
