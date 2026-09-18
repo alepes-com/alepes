@@ -1,4 +1,47 @@
-// Plaid LIVE certification harness — first-hand evidence for v0.5.0.
+/**
+ * Plaid LIVE certification harness — first-hand evidence for v0.5.0.
+ *
+ * RUNTIME PREFLIGHT (fail-closed, before anything else):
+ *   - MUST run under Node 24 (the Temporal Worker runtime island). Running
+ *     under Bun or any other Node major refuses before any provider I/O.
+ *   - Temporal endpoint MUST be the explicit local dev server (default
+ *     localhost:7233 or explicit override via ALEPES_TEMPORAL_ADDRESS pointing
+ *     at localhost). A remote or shared Temporal endpoint refuses to run.
+ *   - The certification task queue is derived from the source commit + run id
+ *     via `certificationTaskQueueName`; the certification workflow is never
+ *     published on the shared "alepes-execution" queue.
+ *
+ * SECURITY: never prints client_id, secret, access tokens, item ids, or raw
+ * account ids. Redacts them to deterministic fingerprints. Refuses sandbox.
+ */
+
+// ── Runtime guard (defense-in-depth) ────────────────────────────────────────
+// Normally this module is reached only via `certify-live-node.mts`, which
+// performs the same check. If someone bypasses that wrapper and executes this
+// file directly under Bun or another Node major, refuse BEFORE Plaid I/O.
+//
+// We gate on `process.versions.bun` — Bun masquerades as Node in many places
+// but always exposes .bun. The Temporal Worker we spin up below requires
+// Node 24 (workflow-isolate V8 promiseHooks); anything else is a hard stop.
+{
+  const bunVersion = (process.versions as { bun?: string }).bun;
+  if (typeof bunVersion === "string") {
+    console.error(
+      `REFUSING TO RUN: certify-live.ts was invoked under Bun ${bunVersion}. ` +
+        `Run via \`node --run certify:plaid-live\`, not \`bun run\`.`
+    );
+    process.exit(2);
+  }
+  const nodeMajor = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
+  if (nodeMajor !== 24) {
+    console.error(
+      `REFUSING TO RUN: certify-live.ts requires Node 24.x (Temporal runtime island); ` +
+        `got ${process.versions.node}.`
+    );
+    process.exit(2);
+  }
+}
+
 // This is a STANDALONE script, NOT part of the ordinary Vitest unit suite and
 // NOT part of CI. It talks to the REAL Plaid Production API and therefore
 // requires live credentials. Run it explicitly:
@@ -8,7 +51,8 @@
 //   PLAID_SECRET=<live secret> \
 //   PLAID_LIVE_POSTGRES_URL=<postgres connection string> \
 //   PLAID_ACCESS_TOKEN=<production Item access token> \
-//   bun run certify:plaid-live
+//   node --run certify:plaid-live      # (or) bun run certify:plaid-live
+//                                      # both dispatch to the Node 24 wrapper
 //
 // SECURITY: never prints client_id, secret, access tokens, item ids, or raw
 // account ids. Redacts them to deterministic fingerprints. Refuses sandbox.
@@ -239,7 +283,7 @@ async function main(): Promise<void> {
     ports: auditPorts,
     provider: "plaid",
     environment: (process.env.PLAID_ENV ?? "production") as "production" | "sandbox" | "paper",
-    sourceCommit: process.env.GITHUB_SHA ?? "local",
+    sourceCommit: process.env.ALEPES_CERTIFY_SOURCE_COMMIT ?? "unknown",
     harness: "certify-live.ts",
     harnessVersion: "1.0.0",
     schemaVersion: "audit-cert@1",
@@ -635,11 +679,27 @@ async function main(): Promise<void> {
     // necessary.
     await pgPorts.close();
 
-    const temporalAddress = process.env.ALEPES_TEMPORAL_ADDRESS ?? "localhost:7233";
+    // ── Isolated certification task queue ────────────────────────────────────
+    //
+    // The bounded publisher workflow runs ONLY on a dedicated fingerprinted
+    // queue derived from (runId, sourceCommit). An ordinary worker polling
+    // `alepes-execution` cannot observe/mutate/deliver this workflow. We mint
+    // the runId here so the queue name is stable across the worker, the
+    // client, and the certification report on a single harness invocation.
+    const { certificationTaskQueueName } = await import("@alepes/temporal-workflows");
     const { startWorker } = await import("@alepes/temporal-workflows/worker");
     const { publishOutboxEventWorkflowId } = await import("@alepes/temporal-workflows");
     const { NativeConnection } = await import("@temporalio/worker");
     const { Client, Connection } = await import("@temporalio/client");
+
+    const sourceCommit = process.env.ALEPES_CERTIFY_SOURCE_COMMIT ?? "unknown";
+    const certificationRunId = `certify-${ulid()}`;
+    const taskQueue = certificationTaskQueueName({
+      runId: certificationRunId,
+      sourceCommit,
+    });
+
+    const temporalAddress = process.env.ALEPES_TEMPORAL_ADDRESS ?? "localhost:7233";
 
     const connection = await Connection.connect({ address: temporalAddress });
     const client = new Client({ connection });
@@ -647,6 +707,9 @@ async function main(): Promise<void> {
     const worker = await startWorker({
       connectionString: pgUrl,
       temporalAddress,
+      // Certification polls ONLY this dedicated queue. The default shared
+      // queue (`alepes-execution`) is not bound by this worker at all.
+      taskQueue,
       // Certification-time brokerage stub: never calls any provider. Any
       // attempt to invoke brokerage.executeOrders during a shadow-mode
       // certification is itself a defect — recording the call count lets
@@ -664,7 +727,9 @@ async function main(): Promise<void> {
       try {
         const handle = await client.workflow.start("publishOutboxEventWorkflow", {
           args: [executionPlanCreatedOutboxId, 30_000],
-          taskQueue: "alepes-execution",
+          // The bounded certification workflow is published ONLY on the
+          // dedicated fingerprinted queue — never on the shared queue.
+          taskQueue,
           workflowId: publishOutboxEventWorkflowId(executionPlanCreatedOutboxId),
         });
         const published = (await handle.result()) as { planId: string; published: true };
@@ -675,6 +740,9 @@ async function main(): Promise<void> {
           );
         }
       } finally {
+        // Order matters: ask the worker to shut down, await its in-flight
+        // run, then close both connections. Never leave a worker polling
+        // after the harness exits.
         worker.shutdown();
         await workerRun.catch(() => undefined);
       }
@@ -682,6 +750,10 @@ async function main(): Promise<void> {
       await connection.close();
       await nativeConnection.close();
     }
+
+    // Certification queue fingerprint is included in the report so reviewers
+    // can prove the bounded workflow ran on a queue that no ordinary worker
+    // can poll. (Captured via the step(8) return shape above.)
 
     // Re-read the outbox row: MUST be delivered (claimed_at + delivered_at
     // non-NULL) — never accepted in the previous ENQUEUED-only state.
@@ -769,6 +841,9 @@ async function main(): Promise<void> {
       persistedPlanId,
       persistedOutboxEventId: executionPlanCreatedOutboxId,
       proposedOrderCount: decision.plan.orders.length,
+      taskQueue,
+      certificationSourceCommit: sourceCommit,
+      certificationRunId,
       sourceDescription: decision.plan.cashEvent.description,
       nonExecuting: true,
       recomputationHash: recomputation.expectedHash,

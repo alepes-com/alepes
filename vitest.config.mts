@@ -49,6 +49,15 @@ alias["@alepes/alpaca-brokerage-data"] = path.resolve(
   dirname,
   "./packages/integrations/alpaca-brokerage-data/src/index.ts"
 );
+// Deeper subpath aliases (packages exporting more than just src/index.ts).
+alias["@alepes/temporal-workflows/worker"] = path.resolve(
+  dirname,
+  "./packages/temporal-workflows/src/worker.ts"
+);
+alias["@alepes/temporal-workflows/certification-preflight"] = path.resolve(
+  dirname,
+  "./packages/temporal-workflows/src/certification-preflight.ts"
+);
 
 export default defineConfig({
   plugins: [react()],

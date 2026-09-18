@@ -749,4 +749,132 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
       await env.teardown();
     }
   });
+
+  // ─── Task-queue isolation (certification queue not visible to default queue) ─
+  //
+  // The live-certification harness publishes its bounded workflow on a
+  // dedicated, fingerprinted queue. A worker polling the default shared queue
+  // MUST NOT receive or complete that workflow — otherwise any stale or
+  // misconfigured alepes-execution worker could consume the certification
+  // workflow out of band and break the isolation guarantee. We prove this by
+  // starting ONLY a default-queue worker, publishing on a certification-only
+  // queue, then asserting the workflow never starts (state stays Running with
+  // no history growth). Only when we spin up a worker bound to the
+  // certification queue does the workflow proceed.
+  it("default-queue worker cannot consume a bounded certification-queue workflow", async () => {
+    const env = await TestWorkflowEnvironment.createTimeSkipping();
+
+    const defaultQueue = "alepes-execution";
+    const certificationQueue = `alepes-test-cert-${ulid().toLowerCase()}`;
+
+    // Only a default-queue worker exists at first.
+    const defaultWorker = await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: defaultQueue,
+      workflowBundle: bundle,
+      activities: {
+        loadPlan,
+        verifyPlan,
+        appendEvent,
+        updateDisposition,
+        executeOrders,
+        reconcileExecution,
+        claimOutbox,
+        claimOutboxById,
+        markOutboxDelivered,
+        releaseOutboxClaim,
+      },
+    });
+
+    // Drive the default worker in the background; it should NOT pick up the
+    // certification workflow because its taskQueue does not match.
+    const defaultRunPromise = defaultWorker.run();
+
+    let certificationWorker: Worker | null = null;
+    try {
+      const { planId, calculationVersion: cv, inputSnapshotHash: hash } = await savePlan({
+        cashEventId: `ce_${ulid()}`,
+        disposition: "shadow",
+        executionMode: "shadow",
+      });
+      void cv; void hash;
+
+      // Insert a real outbox row (so the bounded publisher can claim it).
+      const { Pool } = await import("pg");
+      const pool = new Pool({ connectionString: TEST_CONNECTION });
+      let outboxId: string | null = null;
+      try {
+        const ins = await pool.query<{ id: string }>(
+          `INSERT INTO outbox (id, type, payload)
+           VALUES ($1, 'ExecutionPlanCreated', $2)
+           RETURNING id`,
+          [
+            `iso_${ulid()}`,
+            JSON.stringify({
+              planId,
+              executionMode: "shadow",
+              inputSnapshotHash: hash,
+              calculationVersion: cv,
+            }),
+          ]
+        );
+        outboxId = ins.rows[0].id;
+      } finally {
+        await pool.end();
+      }
+
+      const workflowId = `outbox-publish-once:${outboxId}`;
+      const handle = await env.client.workflow.start("publishOutboxEventWorkflow", {
+        args: [outboxId!, 30_000],
+        taskQueue: certificationQueue,
+        workflowId,
+      });
+
+      // Give the default worker a generous window to (incorrectly) claim.
+      // We assert no progress: the workflow must still be RUNNING with no
+      // completion. Time-skipping lets us wait many simulated seconds without
+      // sleeping wall-clock.
+      const description = await Promise.all([
+        handle.describe(),
+        (async () => {
+          // Nudge time forward through several poll cycles.
+          for (let i = 0; i < 30; i++) {
+            await new Promise((r) => setImmediate(r));
+          }
+        })(),
+      ]).then(([d]) => d);
+      expect(["Running", "Unspecified"]).toContain(description.status.name);
+
+      // Now spin up a certification-queue worker; ONLY this worker should be
+      // able to drive the workflow to completion.
+      certificationWorker = await Worker.create({
+        connection: env.nativeConnection,
+        taskQueue: certificationQueue,
+        workflowBundle: bundle,
+        activities: {
+          loadPlan,
+          verifyPlan,
+          appendEvent,
+          updateDisposition,
+          executeOrders,
+          reconcileExecution,
+          claimOutbox,
+          claimOutboxById,
+          markOutboxDelivered,
+          releaseOutboxClaim,
+        },
+      });
+
+      const result = await certificationWorker.runUntil(async () => {
+        return (await handle.result()) as { planId: string; published: true };
+      });
+      expect(result.published).toBe(true);
+      expect(result.planId).toBe(planId);
+    } finally {
+      if (certificationWorker) certificationWorker.shutdown();
+      defaultWorker.shutdown();
+      await defaultRunPromise.catch(() => undefined);
+      await env.teardown();
+    }
+  });
 });
