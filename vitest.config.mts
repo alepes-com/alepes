@@ -58,6 +58,10 @@ alias["@alepes/temporal-workflows/certification-preflight"] = path.resolve(
   dirname,
   "./packages/temporal-workflows/src/certification-preflight.ts"
 );
+alias["@alepes/temporal-workflows/source-provenance"] = path.resolve(
+  dirname,
+  "./packages/temporal-workflows/src/source-provenance.ts"
+);
 
 export default defineConfig({
   plugins: [react()],

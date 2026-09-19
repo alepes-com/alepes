@@ -831,19 +831,36 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
       });
 
       // Give the default worker a generous window to (incorrectly) claim.
-      // We assert no progress: the workflow must still be RUNNING with no
-      // completion. Time-skipping lets us wait many simulated seconds without
-      // sleeping wall-clock.
-      const description = await Promise.all([
-        handle.describe(),
-        (async () => {
-          // Nudge time forward through several poll cycles.
-          for (let i = 0; i < 30; i++) {
-            await new Promise((r) => setImmediate(r));
-          }
-        })(),
-      ]).then(([d]) => d);
-      expect(["Running", "Unspecified"]).toContain(description.status.name);
+      // Stronger proof than the previous implementation (ADVERSE-2):
+      //   1. poll describe() in a loop over a bounded wall-time window — any
+      //      completion by the default-queue worker would surface as a
+      //      non-Running status well before the deadline,
+      //   2. inspect workflow history length: zero workflow-task-completed
+      //      events => the default-queue worker never even scheduled a task.
+      const deadline = Date.now() + 2_000;
+      let lastDesc = await handle.describe();
+      while (Date.now() < deadline) {
+        const name = lastDesc.status.name;
+        if (name !== "RUNNING" && name !== "UNSPECIFIED") {
+          throw new Error(
+            `default-queue worker should never complete a certification-queue workflow; got status ${name}`
+          );
+        }
+        await new Promise((r) => setImmediate(r));
+        lastDesc = await handle.describe();
+      }
+      expect(["RUNNING", "UNSPECIFIED"]).toContain(lastDesc.status.name);
+
+      // The default-queue worker must not have scheduled or completed a single
+      // workflow task on this run. History length of 1 means only the
+      // WorkflowExecutionStarted event exists; anything greater indicates the
+      // workflow made observable progress, which would break isolation.
+      const history = await handle.fetchHistory();
+      const events = history?.events ?? [];
+      const completedWft = events.filter(
+        (e) => e.eventType === 5 /* EVENT_TYPE_WORKFLOW_TASK_COMPLETED */
+      );
+      expect(completedWft.length).toBe(0);
 
       // Now spin up a certification-queue worker; ONLY this worker should be
       // able to drive the workflow to completion.

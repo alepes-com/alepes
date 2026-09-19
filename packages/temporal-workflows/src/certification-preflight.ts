@@ -40,10 +40,20 @@ const LOCAL_PORT = 7233;
  * must fail-closed.
  */
 export function preflightTemporalEndpoint(raw: string): TemporalEndpointClassification {
-  const trimmed = String(raw ?? "").trim();
-  if (trimmed.length === 0) {
-    return { kind: "invalid", summary: "empty address" };
+  const original = String(raw ?? "");
+  // Reject any leading/trailing whitespace outright. The classifier must not
+  // silently accept a form Connection.connect would later reject — accepting
+  // " localhost:7233" or "localhost:7233 \n" would reintroduce ADVERSE-1, in
+  // which classify-and-connect disagree and the certified behaviour diverges
+  // from the adjudicated intent. Whitespace input is ambiguous; refuse it.
+  if (original.length === 0 || original !== original.trim()) {
+    return {
+      kind: "invalid",
+      summary:
+        original.length === 0 ? "empty address" : "leading or trailing whitespace not allowed",
+    };
   }
+  const trimmed = original;
 
   // Reject URLs — ALEPES_TEMPORAL_ADDRESS is a host:port pair, not a URL.
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {

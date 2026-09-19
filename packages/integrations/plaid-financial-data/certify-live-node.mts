@@ -57,44 +57,34 @@ console.error(
 
 // ── Source-commit provenance ────────────────────────────────────────────────
 //
-// Verify the harness is being run from a known, immutable source commit. In
-// CI this is `GITHUB_SHA`. Locally we accept the current HEAD via `git
-// rev-parse HEAD` (which requires a clean checkout). Refuse to run if the
-// commit cannot be proven AND the worktree is dirty — both checks must
-// succeed for any live certification.
+// The certification ALWAYS binds to the independently derived `git rev-parse
+// HEAD` of the working tree. An ambient `GITHUB_SHA` (e.g. exported by a
+// developer from an unrelated build) MUST NOT bypass local git checks — in
+// particular it must not skip the clean-worktree requirement. Under GitHub
+// Actions the ambient GITHUB_SHA is still mandatory AND must match HEAD.
+// See packages/temporal-workflows/src/source-provenance.ts for the contract
+// and its test suite for the adversarial matrix.
 
 import { execSync } from "node:child_process";
+import { resolveSourceProvenance } from "@alepes/temporal-workflows/source-provenance";
 
-let sourceCommit: string | null = process.env.GITHUB_SHA ?? null;
-if (!sourceCommit) {
-  try {
-    sourceCommit = execSync("git rev-parse HEAD", { encoding: "utf-8" }).trim();
-  } catch {
-    console.error(
-      "REFUSING TO RUN: could not determine source commit (no GITHUB_SHA and `git rev-parse HEAD` failed)."
-    );
-    process.exit(2);
+const provenance = resolveSourceProvenance(
+  {
+    GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
+    GITHUB_SHA: process.env.GITHUB_SHA,
+  },
+  {
+    revParseHead: () =>
+      execSync("git rev-parse HEAD", { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }),
+    statusPorcelain: () =>
+      execSync("git status --porcelain", { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }),
   }
-  // Local path also requires a clean worktree. A dirty tree means the
-  // harness we run is NOT exactly the harness at HEAD — provenance breaks.
-  try {
-    const dirty = execSync("git status --porcelain", { encoding: "utf-8" }).trim();
-    if (dirty.length > 0) {
-      console.error(
-        "REFUSING TO RUN: local run with dirty worktree would certify against " +
-          "code that is not exactly the HEAD commit. Commit or stash first."
-      );
-      process.exit(2);
-    }
-  } catch {
-    console.error("REFUSING TO RUN: `git status --porcelain` failed; cannot prove worktree cleanliness.");
-    process.exit(2);
-  }
-}
-if (!sourceCommit || sourceCommit.length === 0) {
-  console.error("REFUSING TO RUN: source commit could not be determined.");
+);
+if (!provenance.ok) {
+  console.error(`REFUSING TO RUN: ${provenance.reason}`);
   process.exit(2);
 }
+const sourceCommit = provenance.sourceCommit;
 // Export so the harness reads the same value via env without recomputing.
 process.env.ALEPES_CERTIFY_SOURCE_COMMIT = sourceCommit;
 

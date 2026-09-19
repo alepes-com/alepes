@@ -38,18 +38,36 @@ export function certificationTaskQueueName(input: {
   runId: string;
   sourceCommit: string;
 }): string {
-  const runId = sanitize(input.runId);
-  const commit = sanitize(input.sourceCommit);
-  if (runId.length === 0) throw new Error("certificationTaskQueueName requires a non-empty runId");
-  if (commit.length === 0) throw new Error("certificationTaskQueueName requires a non-empty sourceCommit");
-  return `${CERTIFICATION_TASK_QUEUE_PREFIX}-${commit}-${runId}`;
+  // Refuse lossy sanitize: if the raw input contains any character Temporal
+  // would not accept verbatim, distinct (runId, sourceCommit) pairs can
+  // collide (e.g. 'a.b/c' vs 'abc' both sanitize to 'abc'). Fail closed
+  // instead of silently mapping to a shared queue. Callers must supply a
+  // strictly-safe identifier (typically a ULID and a 40-hex SHA).
+  const runId = requireSafe(input.runId, "runId");
+  const sourceCommit = requireSafe(input.sourceCommit, "sourceCommit");
+  return `${CERTIFICATION_TASK_QUEUE_PREFIX}-${sourceCommit}-${runId}`;
 }
 
 /**
- * Temporal task-queue names allow [a-zA-Z0-9-]. Strip anything else (dots,
- * slashes, underscores in ULIDs are already safe but be strict). Cap total
- * length well under Temporal's per-queue length budget.
+ * Require the identifier to be non-empty and composed ONLY of characters
+ * Temporal task-queue names accept verbatim: lowercase ASCII letters, digits,
+ * and hyphens. Anything else — dots, slashes, underscores, uppercase,
+ * whitespace, unicode — fails closed. Uppercase is rejected rather than
+ * downcased to preserve input/output equality (no silent collisions).
  */
-function sanitize(value: string): string {
-  return String(value).toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 40);
+function requireSafe(value: string, label: string): string {
+  if (value.length === 0) {
+    throw new Error(`certificationTaskQueueName requires a non-empty ${label}`);
+  }
+  if (value.length > 40) {
+    throw new Error(
+      `certificationTaskQueueName: ${label} is ${value.length} chars; max 40 to leave room for prefix and the other segment`
+    );
+  }
+  if (!/^[a-z0-9-]+$/.test(value)) {
+    throw new Error(
+      `certificationTaskQueueName: ${label} contains characters outside [a-z0-9-]; refusing to sanitize (possible collision attack vector) — got ${JSON.stringify(value).slice(0, 80)}`
+    );
+  }
+  return value;
 }

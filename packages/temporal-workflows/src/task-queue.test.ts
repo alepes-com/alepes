@@ -34,8 +34,26 @@ describe("certificationTaskQueueName", () => {
   });
 
   it("sanitizes special characters (no dots, slashes, uppercase)", () => {
-    const q = certificationTaskQueueName({ runId: "R_1.A/B", sourceCommit: "ABCDEF0.G" });
-    expect(q).toMatch(/^[a-z0-9-]+$/);
+    // ADVERSE-4 fix: previously the sanitizer was lossy ('a.b/c' -> 'abc'),
+    // letting distinct (runId, sourceCommit) pairs collide onto one queue.
+    // Now any character outside [a-z0-9-] is REJECTED. The failure mode is
+    // fail-closed at configuration time instead of silent collision.
+    expect(() =>
+      certificationTaskQueueName({ runId: "R_1.A/B", sourceCommit: "ABCDEF0.G" })
+    ).toThrow(/outside \[a-z0-9-\]/);
+    expect(() =>
+      certificationTaskQueueName({ runId: "abc", sourceCommit: "ABCDEF0.G" })
+    ).toThrow(/outside \[a-z0-9-\]/);
+  });
+
+  it("proves distinct safe inputs actually produce distinct queue names", () => {
+    // Direct ADVERSE-4 regression: 'a.b/c' and 'abc' used to collide. Now
+    // the first is rejected outright; the second round-trips.
+    const good = certificationTaskQueueName({ runId: "abc", sourceCommit: "def" });
+    expect(good).toBe("alepes-certification-def-abc");
+    // A '--' or leading/trailing hyphen is still safe (verbatim).
+    const dashed = certificationTaskQueueName({ runId: "a-b", sourceCommit: "c-d" });
+    expect(dashed).toBe("alepes-certification-c-d-a-b");
   });
 
   it("throws on empty runId", () => {
@@ -74,6 +92,25 @@ describe("preflightTemporalEndpoint", () => {
     expect(preflightTemporalEndpoint("").kind).toBe("invalid");
     expect(preflightTemporalEndpoint("localhost").kind).toBe("invalid");
     expect(preflightTemporalEndpoint("localhost:notaport").kind).toBe("invalid");
+  });
+
+  it("refuses leading/trailing whitespace (ADVERSE-1 fail-closed)", () => {
+    // Previously classify-and-connect could disagree: the classifier was
+    // whitespace-tolerant, but `Connection.connect` semantics differ. Now
+    // any leading or trailing whitespace (including tabs/newlines) refuses.
+    for (const bad of [
+      " localhost:7233",
+      "localhost:7233 ",
+      "\tlocalhost:7233",
+      "localhost:7233\n",
+      "localhost:7233\r\n",
+    ]) {
+      const c = preflightTemporalEndpoint(bad);
+      expect(c.kind).toBe("invalid");
+    }
+    // Internal whitespace is also refused downstream via port parse failure
+    // or non-local host; assert one representative case is not local.
+    expect(preflightTemporalEndpoint("local host:7233").kind).not.toBe("local");
   });
 
   it("never echoes credentials in any classification", () => {

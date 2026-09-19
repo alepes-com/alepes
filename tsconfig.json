@@ -32,6 +32,7 @@
       "@alepes/temporal-workflows": ["./packages/temporal-workflows/src/index.ts"],
       "@alepes/temporal-workflows/worker": ["./packages/temporal-workflows/src/worker.ts"],
       "@alepes/temporal-workflows/certification-preflight": ["./packages/temporal-workflows/src/certification-preflight.ts"],
+      "@alepes/temporal-workflows/source-provenance": ["./packages/temporal-workflows/src/source-provenance.ts"],
       "@alepes/mock-bank": ["./packages/integrations/mock-bank/src/index.ts"],
       "@alepes/mock-brokerage": ["./packages/integrations/mock-brokerage/src/index.ts"],
       "@alepes/mock-financial-data": ["./packages/integrations/mock-financial-data/src/index.ts"],
