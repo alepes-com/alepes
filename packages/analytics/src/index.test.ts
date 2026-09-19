@@ -63,8 +63,8 @@ runIntegration("PostgresAnalyticsEngine (real PostgreSQL)", () => {
       await pool.query(
         `INSERT INTO execution_plans
            (id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id,
-            calculation_version, input_snapshot_hash, deployable_cents, disposition)
-         VALUES ($1, 'p', $2, 'rv', 'pv', 'calc', 'hash', 0, 'shadow')
+            calculation_version, input_snapshot_hash, deployable_cents, disposition, execution_mode)
+         VALUES ($1, 'p', $2, 'rv', 'pv', 'calc', 'hash', 0, 'shadow', 'shadow')
          ON CONFLICT (id) DO NOTHING`,
         [row.id, `${row.id}-cash`]
       );

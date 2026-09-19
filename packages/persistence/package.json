@@ -12,6 +12,7 @@
     }
   },
   "dependencies": {
+    "@alepes/audit": "*",
     "@alepes/domain": "*",
     "@alepes/money": "*",
     "pg": "*"

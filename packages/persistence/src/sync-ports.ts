@@ -50,6 +50,13 @@ export type ObservationState = "active" | "removed";
 export interface PersistedObservation {
   id: FinancialObservationId;
   accountBindingId: AccountBindingId;
+  /**
+   * The provider's external transaction reference (e.g. Plaid transaction_id).
+   * Used ONLY at the audit boundary for fingerprinting — never inside rule or
+   * allocation decisions (audit-only provenance).
+   * Optional at the type level for test fixtures; production reads always set it.
+   */
+  externalRef?: ExternalObservationRef;
   amountCents: number;
   direction: "credit" | "debit";
   status: "pending" | "posted";

@@ -19,6 +19,12 @@
     "plaid": "47.0.0",
     "@alepes/money": "*",
     "@alepes/domain": "*",
-    "@alepes/integration-runtime": "*"
+    "@alepes/integration-runtime": "*",
+    "@alepes/audit": "*",
+    "@alepes/persistence": "*",
+    "@alepes/rules-engine": "*",
+    "@alepes/allocation-engine": "*",
+    "@alepes/temporal-workflows": "*",
+    "@temporalio/client": "1.20.1"
   }
 }

@@ -5,4 +5,9 @@
  */
 
 export type { OutboxClaimMsg } from "./types";
-export { claimOutbox, markOutboxDelivered, releaseOutboxClaim } from "./activities";
+export {
+  claimOutbox,
+  claimOutboxById,
+  markOutboxDelivered,
+  releaseOutboxClaim,
+} from "./activities";
