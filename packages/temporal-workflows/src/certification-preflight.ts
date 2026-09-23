@@ -27,6 +27,33 @@ const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "0.0.0.0"]);
 const LOCAL_PORT = 7233;
 
 /**
+ * Strict port grammar (ADVERSE-1): Number.parseInt is a PARSER, not an
+ * acceptance grammar — it silently accepts "7233abc", "+7233", " 7233",
+ * "7233.5", "07233". Classification must not disagree with connection
+ * semantics, so the port string is accepted ONLY if the ENTIRE string is a
+ * canonical unsigned base-10 decimal in range 1..65535:
+ *
+ *   - at least one character, all ASCII digits 0-9;
+ *   - no sign, no whitespace, no decimal point, no suffix/prefix garbage;
+ *   - no leading zero ("07233" refused; "80", "65535" accepted);
+ *   - value within 1..65535 ("0", "65536", "" refused).
+ *
+ * Only the canonical lexeme of exactly port 7233 can classify as local.
+ */
+function parseStrictPort(portStr: string): number | null {
+  if (portStr.length === 0) return null;
+  for (let i = 0; i < portStr.length; i++) {
+    const ch = portStr.charCodeAt(i);
+    if (ch < 48 /* "0" */ || ch > 57 /* "9" */) return null;
+  }
+  // No leading zeroes (except the single digit "0", which then fails range).
+  if (portStr.length > 1 && portStr.charCodeAt(0) === 48) return null;
+  const value = Number(portStr);
+  if (!Number.isSafeInteger(value) || value < 1 || value > 65535) return null;
+  return value;
+}
+
+/**
  * Classify a Temporal endpoint address string WITHOUT ever contacting it.
  *
  * Accepted forms (the only ones considered "local"):
@@ -65,7 +92,7 @@ export function preflightTemporalEndpoint(raw: string): TemporalEndpointClassifi
   let portStr: string;
   if (trimmed.startsWith("[")) {
     // IPv6 bracket form: [::1]:7233
-    const m = trimmed.match(/^\[([^\]]+)\]:(\d+)$/);
+    const m = trimmed.match(/^\[([^\]]+)\]:(.*)$/);
     if (!m) return { kind: "invalid", summary: "malformed IPv6 host:port" };
     host = m[1]!;
     portStr = m[2]!;
@@ -79,9 +106,9 @@ export function preflightTemporalEndpoint(raw: string): TemporalEndpointClassifi
     }
   }
 
-  const port = Number.parseInt(portStr, 10);
-  if (!Number.isFinite(port) || port <= 0 || port > 65535) {
-    return { kind: "invalid", summary: `invalid port ${portStr}` };
+  const port = parseStrictPort(portStr);
+  if (port === null) {
+    return { kind: "invalid", summary: "invalid port" };
   }
 
   // Local classification requires BOTH the host to be loopback AND the port

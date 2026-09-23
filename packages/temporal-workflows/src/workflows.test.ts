@@ -44,6 +44,7 @@ import {
   releaseOutboxClaim,
 } from "./activities";
 import { executionWorkflowId } from "./workflows";
+import { DEFAULT_TASK_QUEUE, certificationTaskQueueName } from "./task-queue";
 
 const TEST_CONNECTION =
   process.env.ALEPES_TEST_WORKFLOW_DATABASE_URL ??
@@ -764,8 +765,19 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
   it("default-queue worker cannot consume a bounded certification-queue workflow", async () => {
     const env = await TestWorkflowEnvironment.createTimeSkipping();
 
-    const defaultQueue = "alepes-execution";
-    const certificationQueue = `alepes-test-cert-${ulid().toLowerCase()}`;
+    // ADVERSE-2: exercise the EXACT production queue-derivation helper used by
+    // certify-live — no ad-hoc "alepes-test-cert-*" queue strings. Derive the
+    // queue twice from one exact tuple (realistic shapes: a 40-char lowercase
+    // hex test SHA and a ULID-shaped run id) and prove both derivations agree.
+    const sourceCommit = "696430929ed024c46ff7048d183973006c6c784a";
+    const runId = ulid().toLowerCase();
+    const workerCertificationQueue = certificationTaskQueueName({ runId, sourceCommit });
+    const clientCertificationQueue = certificationTaskQueueName({ runId, sourceCommit });
+    expect(workerCertificationQueue).toBe(clientCertificationQueue);
+    expect(workerCertificationQueue).not.toBe(DEFAULT_TASK_QUEUE);
+
+    const defaultQueue = DEFAULT_TASK_QUEUE;
+    const certificationQueue = clientCertificationQueue;
 
     // Only a default-queue worker exists at first.
     const defaultWorker = await Worker.create({
@@ -857,9 +869,12 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
       // workflow made observable progress, which would break isolation.
       const history = await handle.fetchHistory();
       const events = history?.events ?? [];
-      const completedWft = events.filter(
-        (e) => e.eventType === 5 /* EVENT_TYPE_WORKFLOW_TASK_COMPLETED */
-      );
+      // EVENT_TYPE_WORKFLOW_TASK_COMPLETED (7, not 5 — the enum value 5 is
+      // WORKFLOW_TASK_SCHEDULED, which fires merely because the server queued
+      // the task, NOT because any worker consumed it). Filter on the payload
+      // presence so an enum-numbering mistake can never silently reintroduce
+      // a false-positive isolation proof.
+      const completedWft = events.filter((e) => e.workflowTaskCompletedEventAttributes != null);
       expect(completedWft.length).toBe(0);
 
       // Now spin up a certification-queue worker; ONLY this worker should be
@@ -887,8 +902,26 @@ runIntegration("workflow orchestration (real Temporal test server + real PG)", (
       });
       expect(result.published).toBe(true);
       expect(result.planId).toBe(planId);
+
+      // ADVERSE-2 (E): exact target outbox row is delivered, disposition stays
+      // shadow, and NO brokerage activity occurred anywhere in the run.
+      {
+        const { Pool } = await import("pg");
+        const pool = new Pool({ connectionString: TEST_CONNECTION });
+        try {
+          const row = await pool.query<{ delivered_at: string | null }>(
+            `SELECT delivered_at FROM outbox WHERE id = $1`,
+            [outboxId]
+          );
+          expect(row.rows).toHaveLength(1);
+          expect(row.rows[0]!.delivered_at).not.toBeNull();
+        } finally {
+          await pool.end();
+        }
+      }
+      expect(brokerCalls).toBe(0);
     } finally {
-      if (certificationWorker) certificationWorker.shutdown();
+      if (certificationWorker && certificationWorker.getState() !== "STOPPED") certificationWorker.shutdown();
       defaultWorker.shutdown();
       await defaultRunPromise.catch(() => undefined);
       await env.teardown();

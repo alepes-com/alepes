@@ -11,6 +11,8 @@
  * The default production/dev task queue. Historical name — every worker
  * and every client that doesn't explicitly override it agrees on this string.
  */
+import { createHash } from "node:crypto";
+
 export const DEFAULT_TASK_QUEUE = "alepes-execution";
 
 /**
@@ -38,14 +40,26 @@ export function certificationTaskQueueName(input: {
   runId: string;
   sourceCommit: string;
 }): string {
-  // Refuse lossy sanitize: if the raw input contains any character Temporal
-  // would not accept verbatim, distinct (runId, sourceCommit) pairs can
-  // collide (e.g. 'a.b/c' vs 'abc' both sanitize to 'abc'). Fail closed
-  // instead of silently mapping to a shared queue. Callers must supply a
-  // strictly-safe identifier (typically a ULID and a 40-hex SHA).
+  // Refuse lossy sanitize: fail closed on any character Temporal would not
+  // accept verbatim. (Presentation-safety only — correctness rests on the
+  // digest below, so tuple boundaries can never collide.)
   const runId = requireSafe(input.runId, "runId");
   const sourceCommit = requireSafe(input.sourceCommit, "sourceCommit");
-  return `${CERTIFICATION_TASK_QUEUE_PREFIX}-${sourceCommit}-${runId}`;
+
+  // ADVERSE-4: identity MUST rest on a cryptographic digest computed over the
+  // EXACT tuple values with an unambiguous boundary encoding. Concatenating
+  // `${sourceCommit}-${runId}` directly is boundary-ambiguous:
+  //   { sourceCommit: "a-b", runId: "c" }   -> "...-a-b-c"
+  //   { sourceCommit: "a",   runId: "b-c" } -> "...-a-b-c"
+  // Hash the fixed-ordered JSON array of the exact pre-presentation inputs
+  // (JSON.stringify length-prefixes strings internally, so no tuple-boundary
+  // ambiguity survives). Any ONE-character change in either input changes the
+  // digest. Do NOT hash sourceCommit + "-" + runId — same ambiguity.
+  const digest = createHash("sha256")
+    .update(JSON.stringify([sourceCommit, runId]), "utf8")
+    .digest("hex")
+    .slice(0, 16);
+  return `${CERTIFICATION_TASK_QUEUE_PREFIX}-${digest}`;
 }
 
 /**
