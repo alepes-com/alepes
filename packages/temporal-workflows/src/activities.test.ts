@@ -68,6 +68,7 @@ runIntegration("temporal activity integration (real PG)", () => {
     deployableCents?: number;
     disposition?: string;
     inputSnapshotHash?: string;
+    executionMode?: "shadow" | "execute";
   }) {
     const id = `plan_${ulid()}`;
     const cv = calculationVersion();
@@ -121,6 +122,7 @@ runIntegration("temporal activity integration (real PG)", () => {
       inputSnapshotHash: hash,
       deployableCents: nonNegativeCents(overrides.deployableCents ?? 200_00),
       disposition: (overrides.disposition ?? "shadow") as PersistableDisposition,
+      executionMode: overrides.executionMode ?? "shadow",
     };
     const savedId = await ports.execution.savePlan(plan);
     return { planId: savedId, calculationVersion: cv, inputSnapshotHash: hash };
@@ -148,6 +150,7 @@ runIntegration("temporal activity integration (real PG)", () => {
         inputSnapshotHash: "x".repeat(64),
         deployableCents: nonNegativeCents(0),
         disposition: "shadow" as PersistableDisposition,
+        executionMode: "shadow",
       })
     ).rejects.toThrow();
     const plans = await pool.query(`SELECT COUNT(*)::int AS n FROM execution_plans`);

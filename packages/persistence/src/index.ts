@@ -1,7 +1,7 @@
 export * from "./ports";
 export * from "./postgres";
 export * from "./sync-ports";
-export { createSyncPostgresStore } from "./sync-postgres";
+export { createSyncPostgresStore, cursorFingerprint } from "./sync-postgres";
 export { qualifyCashEvents } from "./reconcile";
 export {
   inputSnapshotHash,
@@ -10,3 +10,13 @@ export {
   calculationVersion,
 } from "./identity";
 export { runMigrations } from "./migrations";
+export type {
+  CreateCertificationRunInput,
+  CompleteCertificationRunInput,
+  PersistedCertificationRun,
+  AuditEventStore,
+  CertificationRunStore,
+  ProviderCallEvidenceStore,
+  AuditPorts,
+} from "./audit-ports";
+export { createAuditPostgresStore } from "./audit-postgres";
