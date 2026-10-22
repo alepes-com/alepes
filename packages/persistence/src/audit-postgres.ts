@@ -26,7 +26,7 @@ const T_EVENTS = "audit_events";
 const T_PROVIDER_CALLS = "provider_call_evidence";
 
 /** Deterministic 32-bit advisory-lock key derived from runId (same pattern as sync-postgres). */
-function advisoryLockKey(runId: string): number {
+export function advisoryLockKey(runId: string): number {
   let h = 0x811c9dc5;
   for (let i = 0; i < runId.length; i++) {
     h ^= runId.charCodeAt(i);
@@ -404,10 +404,17 @@ export function createAuditPostgresStore(cfg: AuditPostgresConfig): AuditPorts {
       try {
         await client.query("BEGIN");
 
-        // Only complete if not already completed (idempotent)
+        // Serialize completion decisions for this run: acquire a transaction-scoped
+        // advisory lock before inspecting terminal status. Concurrent callers for
+        // the same run block here until the first commits/rolls back, so the
+        // completed_at check below observes the committed terminal state.
+        await client.query("SELECT pg_advisory_xact_lock($1)", [advisoryLockKey(input.runId)]);
+
+        // Lock the run row as well (defense in depth) so no other code path can
+        // mutate terminal status while this transaction decides it.
         const existing = await client.query(
           `SELECT completed_at, result, failure_code, evidence_boundary, gates, mutation_counts, final_state, correlation_id
-             FROM ${T_RUNS} WHERE run_id = $1`,
+             FROM ${T_RUNS} WHERE run_id = $1 FOR UPDATE`,
           [input.runId]
         );
 

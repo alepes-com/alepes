@@ -1,9 +1,9 @@
 // Integration tests: audit + certification persistence against real PostgreSQL.
 // Run with: ALEPES_TEST_AUDIT_DATABASE_URL=postgresql://raelldottin@localhost:5432/alepes_sync_test bun run test packages/persistence/src/audit.test.ts
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { runMigrations } from "./migrations";
-import { createAuditPostgresStore } from "./audit-postgres";
+import { createAuditPostgresStore, advisoryLockKey } from "./audit-postgres";
 import type { AuditPorts, CreateCertificationRunInput, CompleteCertificationRunInput, AuditEvent } from "./audit-ports";
 import type { EvidenceBoundary, GateResult, FailureCode, RunResult } from "@alepes/audit";
 import { ulid } from "./identity";
@@ -400,5 +400,267 @@ runIntegration("audit + certification persistence (real PostgreSQL)", () => {
     expect(loaded).toHaveLength(5);
     const sequences = loaded.map((e) => e.sequence).sort((a, b) => a - b);
     expect(sequences).toEqual([1, 2, 3, 4, 5]); // no gaps, no duplicates
+  });
+
+  // ─── P1 finding 3: concurrent completion race in completeRun ────────────
+  // Six adversarial concurrency tests (Kanban t_21e57af2, PR #6 remediation).
+  // Invariant under test: exactly ONE authoritative terminal transition per run;
+  // the append-only audit ledger never holds contradictory successful terminal
+  // completions for the same run.
+
+  describe("concurrent completion race (P1 finding 3)", () => {
+    function countCompletionEvents(events: AuditEvent[]): number {
+      return events.filter((e) => e.type === "CERT_RUN_COMPLETED").length;
+    }
+
+    async function openAdminPool() {
+      const { Pool } = await import("pg");
+      return new Pool({ connectionString: TEST_CONNECTION });
+    }
+
+    // Deterministically widen the race window: certification_runs UPDATEs sleep
+    // 200ms so a concurrent caller's existing-SELECT (no lock) can observe the
+    // pre-completion state while the first caller's UPDATE holds the row lock.
+    // Isolated test DB only; dropped in afterEach.
+    beforeEach(async () => {
+      const admin = await openAdminPool();
+      try {
+        await admin.query(`
+          CREATE OR REPLACE FUNCTION widen_cert_run_update_race() RETURNS trigger AS $$
+          BEGIN
+            PERFORM pg_sleep(0.2);
+            RETURN NEW;
+          END $$ LANGUAGE plpgsql;
+        `);
+        await admin.query(`DROP TRIGGER IF EXISTS widen_cert_run_update_race_trg ON certification_runs`);
+        await admin.query(`
+          CREATE TRIGGER widen_cert_run_update_race_trg
+            BEFORE UPDATE ON certification_runs
+            FOR EACH ROW EXECUTE FUNCTION widen_cert_run_update_race();
+        `);
+      } finally {
+        await admin.end();
+      }
+    });
+
+    afterEach(async () => {
+      const admin = await openAdminPool();
+      try {
+        await admin.query(`DROP TRIGGER IF EXISTS widen_cert_run_update_race_trg ON certification_runs`);
+        await admin.query(`DROP FUNCTION IF EXISTS widen_cert_run_update_race()`);
+      } catch {
+        // ignore cleanup errors
+      } finally {
+        await admin.end();
+      }
+    });
+
+    it("1. simultaneous PASS and FAIL: only one terminal transition succeeds", async () => {
+      const runId = ulid();
+      const correlationId = ulid();
+      await store.runs.createRun(runInput({ runId, correlationId }));
+
+      const passInput = completeInput(runId);
+      const failInput = completeInput(runId, {
+        result: "FAIL",
+        failureCode: "internal.unexpected" as FailureCode,
+        gates: [{ gate: "preflight", status: "FAIL" }],
+      });
+
+      const results = await Promise.allSettled([
+        store.runs.completeRun(passInput),
+        store.runs.completeRun(failInput),
+      ]);
+      const fulfilled = results.filter((r) => r.status === "fulfilled").length;
+      const rejected = results.filter((r) => r.status === "rejected").length;
+      expect(fulfilled).toBe(1);
+      expect(rejected).toBe(1);
+
+      const run = await store.runs.loadRun(runId);
+      expect(run?.completedAt).not.toBeNull();
+      expect(run?.result).not.toBeNull();
+
+      const events = await store.events.listByRun(runId);
+      expect(countCompletionEvents(events)).toBe(1);
+    });
+
+    it("2. simultaneous FAIL and PASS: only one terminal transition succeeds", async () => {
+      const runId = ulid();
+      const correlationId = ulid();
+      await store.runs.createRun(runInput({ runId, correlationId }));
+
+      const passInput = completeInput(runId);
+      const failInput = completeInput(runId, {
+        result: "FAIL",
+        failureCode: "internal.unexpected" as FailureCode,
+        gates: [{ gate: "preflight", status: "FAIL" }],
+      });
+
+      // Reversed ordering in the array to confirm ordering independence.
+      const results = await Promise.allSettled([
+        store.runs.completeRun(failInput),
+        store.runs.completeRun(passInput),
+      ]);
+      const fulfilled = results.filter((r) => r.status === "fulfilled").length;
+      const rejected = results.filter((r) => r.status === "rejected").length;
+      expect(fulfilled).toBe(1);
+      expect(rejected).toBe(1);
+
+      const run = await store.runs.loadRun(runId);
+      expect(run?.completedAt).not.toBeNull();
+      expect(["PASS", "FAIL"]).toContain(run?.result);
+
+      const events = await store.events.listByRun(runId);
+      expect(countCompletionEvents(events)).toBe(1);
+    });
+
+    it("3. simultaneous PASS and PASS: duplicate identical completion is idempotent", async () => {
+      const runId = ulid();
+      const correlationId = ulid();
+      await store.runs.createRun(runInput({ runId, correlationId }));
+
+      const inputA = completeInput(runId);
+      const inputB = completeInput(runId);
+
+      const results = await Promise.allSettled([
+        store.runs.completeRun(inputA),
+        store.runs.completeRun(inputB),
+      ]);
+      // Both must resolve: one performs the transition, the other is a no-op.
+      expect(results.filter((r) => r.status === "fulfilled").length).toBe(2);
+      expect(results.filter((r) => r.status === "rejected").length).toBe(0);
+
+      const run = await store.runs.loadRun(runId);
+      expect(run?.result).toBe("PASS");
+
+      // Exactly one completion event — not two.
+      const events = await store.events.listByRun(runId);
+      expect(countCompletionEvents(events)).toBe(1);
+    });
+
+    it("4. sequential conflicting outcomes: later conflicting outcome is rejected", async () => {
+      const runId = ulid();
+      const correlationId = ulid();
+      await store.runs.createRun(runInput({ runId, correlationId }));
+
+      await expect(store.runs.completeRun(completeInput(runId))).resolves.toBeUndefined();
+
+      await expect(
+        store.runs.completeRun(
+          completeInput(runId, {
+            result: "FAIL",
+            failureCode: "internal.unexpected" as FailureCode,
+            gates: [{ gate: "preflight", status: "FAIL" }],
+          })
+        )
+      ).rejects.toThrow(/already completed with different outcome/);
+
+      const run = await store.runs.loadRun(runId);
+      expect(run?.result).toBe("PASS");
+
+      const events = await store.events.listByRun(runId);
+      expect(countCompletionEvents(events)).toBe(1);
+    });
+
+    it("5. concurrent completion with intentional lock contention", async () => {
+      const runId = ulid();
+      const correlationId = ulid();
+      await store.runs.createRun(runInput({ runId, correlationId }));
+
+      const key = advisoryLockKey(runId);
+
+      // Hold the advisory lock on a separate connection to force contention.
+      const { Pool } = await import("pg");
+      const holder = new Pool({ connectionString: TEST_CONNECTION });
+      const holderClient = await holder.connect();
+      await holderClient.query("BEGIN");
+      await holderClient.query("SELECT pg_advisory_xact_lock($1)", [key]);
+
+      let completed = false;
+      const completionPromise = store.runs
+        .completeRun(completeInput(runId))
+        .then(() => {
+          completed = true;
+        });
+
+      // Give the completion a chance to attempt the lock (it must be blocked).
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(completed).toBe(false);
+
+      // Release the lock; completion must now proceed.
+      await holderClient.query("COMMIT");
+      holderClient.release();
+      await holder.end();
+
+      await completionPromise;
+      expect(completed).toBe(true);
+
+      const run = await store.runs.loadRun(runId);
+      expect(run?.result).toBe("PASS");
+
+      const events = await store.events.listByRun(runId);
+      expect(countCompletionEvents(events)).toBe(1);
+    });
+
+    it("6. rollback when completion-event insertion fails: run stays incomplete", async () => {
+      const runId = ulid();
+      const correlationId = ulid();
+      await store.runs.createRun(runInput({ runId, correlationId }));
+
+      const safeRunId = /^[0-9a-z]{22}$/.test(runId) ? runId : null;
+      expect(safeRunId).not.toBeNull();
+
+      const triggerName = `fail_cert_completion_${runId}`;
+      const fnName = `fail_cert_completion_fn_${runId}`;
+
+      const admin = await openAdminPool();
+      try {
+        await admin.query(`
+          CREATE OR REPLACE FUNCTION ${fnName}() RETURNS trigger AS $$
+          BEGIN
+            IF NEW.run_id = '${runId}' AND NEW.type = 'CERT_RUN_COMPLETED' THEN
+              RAISE EXCEPTION 'injected completion-event insert failure';
+            END IF;
+            RETURN NEW;
+          END $$ LANGUAGE plpgsql;
+        `);
+        await admin.query(`
+          DROP TRIGGER IF EXISTS ${triggerName} ON audit_events;
+          CREATE TRIGGER ${triggerName} BEFORE INSERT ON audit_events
+            FOR EACH ROW EXECUTE FUNCTION ${fnName}();
+        `);
+
+        // The completion must fail because the event insert is blocked.
+        await expect(store.runs.completeRun(completeInput(runId))).rejects.toThrow(
+          /injected completion-event insert failure/
+        );
+
+        // Rollback: the run must remain incomplete (UPDATE reverted).
+        const run = await store.runs.loadRun(runId);
+        expect(run?.completedAt).toBeNull();
+        expect(run?.result).toBeNull();
+
+        // No completion event persisted.
+        const events = await store.events.listByRun(runId);
+        expect(countCompletionEvents(events)).toBe(0);
+
+        // Cleanup trigger/function before retrying.
+        await admin.query(`DROP TRIGGER IF EXISTS ${triggerName} ON audit_events`);
+        await admin.query(`DROP FUNCTION IF EXISTS ${fnName}()`);
+
+        // Recovery: a subsequent completion succeeds.
+        await expect(store.runs.completeRun(completeInput(runId))).resolves.toBeUndefined();
+
+        const run2 = await store.runs.loadRun(runId);
+        expect(run2?.result).toBe("PASS");
+
+        const events2 = await store.events.listByRun(runId);
+        expect(countCompletionEvents(events2)).toBe(1);
+      } finally {
+        await admin.query(`DROP TRIGGER IF EXISTS ${triggerName} ON audit_events`).catch(() => {});
+        await admin.query(`DROP FUNCTION IF EXISTS ${fnName}()`).catch(() => {});
+        await admin.end();
+      }
+    });
   });
 });
