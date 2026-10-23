@@ -131,10 +131,16 @@ import {
   type RunContext,
 } from "./src/certify-live-audit";
 
-// ─── Environment guard ────────────────────────────────────────────────────────
+import { projectPublicReport } from "./src/certify-live-report";
+export * from "./src/certify-live-report";
+
+// Allow the module to be imported in test contexts (e.g. to exercise the public
+// report projection) without triggering the production-only guards / process.exit.
+const __isTestContext =
+  process.env.VITEST === "true" || process.env.NODE_ENV === "test";
 
 const ENV = process.env.PLAID_ENV;
-if (ENV !== "production") {
+if (!__isTestContext && ENV !== "production") {
   console.error(
     `REFUSING TO RUN: PLAID_ENV must be exactly "production" (got ${JSON.stringify(ENV ?? "unset")}). ` +
       "This harness contacts Plaid Production (api.plaid.com) only."
@@ -145,15 +151,15 @@ const CLIENT_ID = process.env.PLAID_CLIENT_ID;
 const SECRET = process.env.PLAID_SECRET;
 const POSTGRES_URL = process.env.PLAID_LIVE_POSTGRES_URL;
 const ACCESS_TOKEN = process.env.PLAID_ACCESS_TOKEN;
-if (!CLIENT_ID || !SECRET) {
+if (!__isTestContext && (!CLIENT_ID || !SECRET)) {
   console.error("REFUSING TO RUN: PLAID_CLIENT_ID and PLAID_SECRET must both be set (production).");
   process.exit(2);
 }
-if (!POSTGRES_URL) {
+if (!__isTestContext && !POSTGRES_URL) {
   console.error("REFUSING TO RUN: PLAID_LIVE_POSTGRES_URL must be set for persistence.");
   process.exit(2);
 }
-if (!ACCESS_TOKEN) {
+if (!__isTestContext && !ACCESS_TOKEN) {
   console.error(
     "REFUSING TO RUN: PLAID_ACCESS_TOKEN must be set (production). " +
       "It must be a real Production Item access token created through Plaid Link " +
@@ -161,10 +167,10 @@ if (!ACCESS_TOKEN) {
   );
   process.exit(2);
 }
-const clientId: string = CLIENT_ID!;
-const secret: string = SECRET!;
-const pgUrl: string = POSTGRES_URL!;
-const accessToken: string = ACCESS_TOKEN!;
+const clientId: string = CLIENT_ID ?? "";
+const secret: string = SECRET ?? "";
+const pgUrl: string = POSTGRES_URL ?? "";
+const accessToken: string = ACCESS_TOKEN ?? "";
 
 // ─── Redaction helpers ────────────────────────────────────────────────────────
 
@@ -181,7 +187,7 @@ const accountIds: string[] = [];
 
 // Register the supplied access token for redaction before any output is produced.
 // ACCESS_TOKEN was verified present above; this keeps it out of every log/artifact.
-accessTokens.push(accessToken);
+if (accessToken) accessTokens.push(accessToken);
 
 function redact(s: unknown): unknown {
   if (typeof s !== "string") {
@@ -194,11 +200,11 @@ function redact(s: unknown): unknown {
     return s;
   }
   let out = s;
-  out = out.replaceAll(CLIENT_ID!, "REDACTED_CLIENT_ID");
-  out = out.replaceAll(SECRET!, "REDACTED_SECRET");
+  if (CLIENT_ID) out = out.replaceAll(CLIENT_ID, "REDACTED_CLIENT_ID");
+  if (SECRET) out = out.replaceAll(SECRET, "REDACTED_SECRET");
   for (const tok of accessTokens) out = out.replaceAll(tok, `REDACTED_ACCESS_TOKEN(${fp(tok)})`);
-  for (const id of itemIds) out = out.replaceAll(id, `REDACTED_ITEM_ID(${fp(id)})`);
-  for (const id of accountIds) out = out.replaceAll(id, `REDACTED_ACCOUNT_ID(${fp(id)})`);
+  for (const id of itemIds) if (id) out = out.replaceAll(id, `REDACTED_ITEM_ID(${fp(id)})`);
+  for (const id of accountIds) if (id) out = out.replaceAll(id, `REDACTED_ACCOUNT_ID(${fp(id)})`);
   return out;
 }
 
@@ -930,14 +936,15 @@ async function main(): Promise<void> {
     allPass: points.every((p) => p.status === "pass"),
     note: "No brokerage, no money movement occurred. Shadow disposition only.",
   };
-  const report = redact(rawReport) as { allPass: boolean };
+  const report = redact(projectPublicReport(rawReport)) as { allPass: boolean };
 
   console.log("\n=== PLAID LIVE CERTIFICATION REPORT ===");
   console.log(JSON.stringify(report, null, 2));
   process.exit(report.allPass ? 0 : 1);
 }
 
-main().catch(async (e) => {
+if (!__isTestContext) {
+  main().catch(async (e) => {
   // Failure-path completion: emit a durable ABORTED run if the run had started.
   // Guard against double-completion when completeRun already called before throw.
   if (activeCtx && auditPorts && !runCompleted) {
@@ -965,3 +972,4 @@ main().catch(async (e) => {
   console.error("HARNESS ERROR:", redact(e instanceof Error ? e.message : String(e)));
   process.exit(3);
 });
+}
