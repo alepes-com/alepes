@@ -103,16 +103,25 @@ BEGIN
   END IF;
 END$$;
 
--- Rebuild the trigger function with the new column included.
+-- Rebuild the trigger function with the new column included. The immutable
+-- comparison must enumerate EVERY execution_plans column except `disposition`
+-- (the lifecycle column): ownership (user_id, portfolio_id) and the recorded
+-- plan (plan_data) are history exactly like the provenance columns. All
+-- comparisons use IS DISTINCT FROM, which is NULL-safe — a plain `<>` chain
+-- would silently accept NULL<->value rewrites on the nullable columns
+-- (user_id, plan_data).
 CREATE OR REPLACE FUNCTION execution_plans_lifecycle_guard() RETURNS TRIGGER AS $$
 BEGIN
   IF OLD.id IS DISTINCT FROM NEW.id
+     OR OLD.user_id IS DISTINCT FROM NEW.user_id
+     OR OLD.portfolio_id IS DISTINCT FROM NEW.portfolio_id
      OR OLD.cash_event_id IS DISTINCT FROM NEW.cash_event_id
      OR OLD.rule_version_id IS DISTINCT FROM NEW.rule_version_id
      OR OLD.portfolio_version_id IS DISTINCT FROM NEW.portfolio_version_id
      OR OLD.calculation_version IS DISTINCT FROM NEW.calculation_version
      OR OLD.input_snapshot_hash IS DISTINCT FROM NEW.input_snapshot_hash
      OR OLD.deployable_cents IS DISTINCT FROM NEW.deployable_cents
+     OR OLD.plan_data IS DISTINCT FROM NEW.plan_data
      OR OLD.execution_mode IS DISTINCT FROM NEW.execution_mode
      OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN
     RAISE EXCEPTION 'execution_plans are immutable after creation (only disposition may change)';
