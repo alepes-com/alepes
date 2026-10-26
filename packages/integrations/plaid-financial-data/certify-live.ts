@@ -130,6 +130,7 @@ import {
   type CertifyLiveAuditConfig,
   type RunContext,
 } from "./src/certify-live-audit";
+import { buildPublicCertificationReport } from "./src/certify-live-report";
 
 // ─── Environment guard ────────────────────────────────────────────────────────
 
@@ -201,6 +202,18 @@ function redact(s: unknown): unknown {
   for (const id of accountIds) out = out.replaceAll(id, `REDACTED_ACCOUNT_ID(${fp(id)})`);
   return out;
 }
+
+// Redaction inputs for the canonical public-report projection
+// (`buildPublicCertificationReport` in src/certify-live-report.ts). Snapshots
+// the secret registries at call time so ids registered late in the run are
+// still covered. `redact` above remains in use for the audit `detail` records.
+const reportRedactions = () => ({
+  clientId: CLIENT_ID,
+  secret: SECRET,
+  accessTokens: [...accessTokens],
+  itemIds: [...itemIds],
+  accountIds: [...accountIds],
+});
 
 // ─── Provider error classification (module scope; captures nothing) ───────────
 
@@ -930,7 +943,10 @@ async function main(): Promise<void> {
     allPass: points.every((p) => p.status === "pass"),
     note: "No brokerage, no money movement occurred. Shadow disposition only.",
   };
-  const report = redact(rawReport) as { allPass: boolean };
+  // Canonical public projection: strict field allowlist, then secret redaction.
+  // Never print rawReport directly — free-text fields (account names, deposit
+  // descriptions) must not reach public logs or certification evidence (PR #6 F1).
+  const report = buildPublicCertificationReport(rawReport, reportRedactions()) as { allPass: boolean };
 
   console.log("\n=== PLAID LIVE CERTIFICATION REPORT ===");
   console.log(JSON.stringify(report, null, 2));
@@ -962,6 +978,13 @@ main().catch(async (e) => {
       // never mask the original error
     }
   }
-  console.error("HARNESS ERROR:", redact(e instanceof Error ? e.message : String(e)));
+  // Failure path flows through the same canonical public projection. For a
+  // string payload the allowlist is a no-op, so this stays byte-equivalent to
+  // the pre-fix `redact(message)` output while keeping one audited exit for
+  // everything the harness prints publicly (PR #6 F1).
+  console.error(
+    "HARNESS ERROR:",
+    buildPublicCertificationReport(e instanceof Error ? e.message : String(e), reportRedactions())
+  );
   process.exit(3);
 });

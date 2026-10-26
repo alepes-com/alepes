@@ -1,17 +1,26 @@
-// Public-report allowlist for the Plaid live certification harness.
+// Public-report allowlist + canonical public projection for the Plaid live
+// certification harness.
 //
 // The harness previously printed `rawReport` through a replacement-based
 // redactor (`redact`), which cannot remove free-text account names or deposit
-// descriptions that are not known secrets. This module projects the harness's
-// internal report into the public/certification-evidence shape using a strict
-// field-by-field allowlist: any key not explicitly permitted is dropped, so
-// sensitive free-text (account names, employer names, transaction descriptions,
-// and unexpected nested fields) cannot reach public logs or certification
-// evidence. Only nonsensitive certification evidence is preserved.
+// descriptions that are not known secrets. This module is the single canonical
+// implementation of the harness's public-report output:
 //
-// This is the single canonical implementation of the harness public-report
-// projection. `certify-live.ts` (and tests) MUST use it rather than redacting
-// the raw report.
+//   buildPublicCertificationReport(rawReport, redactions)
+//     = redactSecrets(projectPublicReport(rawReport), redactions)
+//
+// `projectPublicReport` applies a strict field-by-field allowlist: any key
+// not explicitly permitted is dropped, so sensitive free-text (account names,
+// employer names, transaction descriptions, and unexpected nested fields)
+// cannot reach public logs or certification evidence. `redactSecrets`
+// reproduces the harness's replacement-based secret redaction (client id,
+// secret, access tokens, item ids, account ids) as defense-in-depth over the
+// already-projected report.
+//
+// certify-live.ts calls `buildPublicCertificationReport` at BOTH public print
+// sites (the success-path certification report and the failure-path error
+// message); the tests exercise this same function. certify-live.ts itself
+// remains a fail-closed standalone script and is never imported by tests.
 
 const TOP_LEVEL_KEYS = new Set<string>([
   "environment",
@@ -162,27 +171,75 @@ export function projectPublicReport(input: unknown): unknown {
   return projectObject(input as Record<string, unknown>, "root");
 }
 
-// Aliases for compatibility with various callers/tests.
-export const toPublicReport = projectPublicReport;
-export const sanitizeLiveReport = projectPublicReport;
-export const sanitizeReport = projectPublicReport;
-export const publicReport = projectPublicReport;
-export const buildPublicReport = projectPublicReport;
-export const redactPublicReport = projectPublicReport;
-export const allowlistReport = projectPublicReport;
-export const projectReport = projectPublicReport;
-export const applyPublicReportAllowlist = projectPublicReport;
-export const projectPublicCertificationReport = projectPublicReport;
+// ─── Replacement-based secret redaction (pinned-head `redact` semantics) ────
 
-export const PUBLIC_REPORT_ALLOWLIST = {
-  topLevel: TOP_LEVEL_KEYS,
-  boundAccount: BOUND_ACCOUNT_KEYS,
-  account: ACCOUNT_KEYS,
-  initialSync: INITIAL_SYNC_KEYS,
-  shadow: SHADOW_KEYS,
-  isolation: ISOLATION_KEYS,
-  point: POINT_KEYS,
-};
+/**
+ * Redaction inputs: the live run's secret values, snapshotted at call time by
+ * the harness (`reportRedactions()` in certify-live.ts).
+ */
+export interface PublicReportRedactions {
+  readonly clientId?: string | undefined;
+  readonly secret?: string | undefined;
+  readonly accessTokens?: readonly string[] | undefined;
+  readonly itemIds?: readonly string[] | undefined;
+  readonly accountIds?: readonly string[] | undefined;
+}
 
-export const publicReportAllowlist = PUBLIC_REPORT_ALLOWLIST;
-export const ALLOWED_PUBLIC_REPORT_FIELDS = PUBLIC_REPORT_ALLOWLIST;
+/**
+ * Deterministic fingerprint — mirrors `fp()` in certify-live.ts so redaction
+ * placeholders stay identical in shape to the rest of the harness output.
+ */
+function fp(value: string): string {
+  let h = 0;
+  for (let i = 0; i < value.length; i++) h = (h * 31 + value.charCodeAt(i)) | 0;
+  return `fp-${(h >>> 0).toString(16)}-len${value.length}`;
+}
+
+function redactString(s: string, r: PublicReportRedactions): string {
+  let out = s;
+  if (r.clientId) out = out.replaceAll(r.clientId, "REDACTED_CLIENT_ID");
+  if (r.secret) out = out.replaceAll(r.secret, "REDACTED_SECRET");
+  for (const tok of r.accessTokens ?? []) {
+    if (tok) out = out.replaceAll(tok, `REDACTED_ACCESS_TOKEN(${fp(tok)})`);
+  }
+  for (const id of r.itemIds ?? []) {
+    if (id) out = out.replaceAll(id, `REDACTED_ITEM_ID(${fp(id)})`);
+  }
+  for (const id of r.accountIds ?? []) {
+    if (id) out = out.replaceAll(id, `REDACTED_ACCOUNT_ID(${fp(id)})`);
+  }
+  return out;
+}
+
+/**
+ * Replacement-based redaction over an arbitrary value tree — the semantics of
+ * the harness's historical `redact()`: replaces only KNOWN secret values,
+ * never free text. Exported so tests can document why it is insufficient
+ * alone (PR #6 Finding 1) and prove the composition still redacts known
+ * secrets inside the canonical projection below.
+ */
+export function redactSecrets(value: unknown, redactions: PublicReportRedactions): unknown {
+  if (typeof value === "string") return redactString(value, redactions);
+  if (Array.isArray(value)) return value.map((v) => redactSecrets(v, redactions));
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = redactSecrets(v, redactions);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * The canonical harness public-report projection: strict allowlist first, then
+ * replacement-based secret redaction as defense-in-depth over the already
+ * projected report. certify-live.ts routes every value it prints publicly
+ * through this function.
+ */
+export function buildPublicCertificationReport(
+  rawReport: unknown,
+  redactions: PublicReportRedactions,
+): unknown {
+  return redactSecrets(projectPublicReport(rawReport), redactions);
+}
