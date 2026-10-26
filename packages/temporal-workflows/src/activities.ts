@@ -49,6 +49,9 @@ const EVENT_KIND_MAP: Record<string, string> = {
   "execution.started": "execution.started",
   "order.submitted": "order.submitted",
   "order.filled": "order.filled",
+  // Simulated shadow-mode fills MUST be distinguishable from real provider
+  // fills in the durable audit log; see packages/persistence/migrations/0007.
+  "shadow.order.filled": "shadow.order.filled",
   "execution.completed": "execution.completed",
   "execution.failed": "execution.failed",
 };
@@ -69,6 +72,7 @@ export async function loadPlan(input: { planId: string }): Promise<LoadPlanOutpu
       deployableCents: plan.deployableCents as number,
       disposition: plan.disposition,
     },
+    executionMode: plan.executionMode,
     orders: orders.map((o) => ({
       id: o.id,
       symbol: o.symbol,
@@ -115,7 +119,7 @@ export async function appendEvent(input: AppendEventInput): Promise<void> {
   } as unknown as Parameters<typeof ports.execution.appendEvent>[1]);
 }
 
-function mapStageToDomain(s: string): "plan_created" | "policy_evaluated" | "approval_requested" | "approval_granted" | "execution_started" | "order_submitted" | "order_filled" | "execution_completed" | "execution_failed" {
+function mapStageToDomain(s: string): "plan_created" | "policy_evaluated" | "approval_requested" | "approval_granted" | "execution_started" | "order_submitted" | "order_filled" | "shadow_order_filled" | "execution_completed" | "execution_failed" {
   switch (s) {
     case "plan.created": return "plan_created";
     case "policy.evaluated": return "policy_evaluated";
@@ -124,6 +128,7 @@ function mapStageToDomain(s: string): "plan_created" | "policy_evaluated" | "app
     case "execution.started": return "execution_started";
     case "order.submitted": return "order_submitted";
     case "order.filled": return "order_filled";
+    case "shadow.order.filled": return "shadow_order_filled";
     case "execution.completed": return "execution_completed";
     case "execution.failed": return "execution_failed";
     default: throw new Error(`unknown audit stage: ${s}`);
@@ -162,6 +167,12 @@ export async function claimOutbox(input: { limit: number; leaseMs: number }): Pr
   const { ports } = ctx();
   const claims = await ports.outbox.claimPending(input.limit, input.leaseMs);
   return claims.map((c) => ({ id: c.id, type: c.type, payload: c.payload }));
+}
+
+export async function claimOutboxById(input: { id: string; leaseMs: number }): Promise<OutboxClaimMsg> {
+  const { ports } = ctx();
+  const claim = await ports.outbox.claimPendingById(input.id as PersistenceId, input.leaseMs);
+  return { id: claim.id, type: claim.type, payload: claim.payload };
 }
 
 export async function markOutboxDelivered(input: { id: string }): Promise<void> {

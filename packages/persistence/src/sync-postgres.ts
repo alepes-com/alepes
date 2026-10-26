@@ -1,6 +1,7 @@
 // PostgreSQL adapter for the provider-sync ports. This is the ONLY module that
 // knows the SQL for financial-data synchronization state.
 
+import { createHash } from "node:crypto";
 import { Pool } from "pg";
 import type { ExternalObservationRef, FinancialObservationId, AccountBalanceSnapshot } from "@alepes/domain";
 import { selectAccountBalance } from "@alepes/domain";
@@ -28,6 +29,19 @@ export interface SyncPostgresConfig {
   connectionString: string;
 }
 
+/** Deterministic fingerprint for cursor verification (sha256 hex, first 16 chars + length). */
+export function cursorFingerprint(cursor: string): string {
+  const hash = createHash("sha256").update(cursor).digest("hex");
+  return `fp-${hash.slice(0, 16)}-len${cursor.length}`;
+}
+
+/**
+ * Manual baseline-checkpoint persistence was REMOVED. A "reconciled" checkpoint
+ * must be produced ONLY via reconcileSyncCycle, which atomically writes the
+ * observation rows, events, and checkpoint together. No caller may bypass that
+ * invariant by minting a checkpoint with an arbitrary cursor.
+ */
+
 /** A deterministic 32-bit advisory-lock key derived from the binding id. */
 function advisoryLockKey(bindingId: AccountBindingId): number {
   // FNV-1a over the binding id string → 32-bit unsigned, stable across nodes.
@@ -46,6 +60,9 @@ function newObservationId(): FinancialObservationId {
 }
 
 export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncStore & { close(): Promise<void> } {
+  if (!cfg.connectionString?.trim()) {
+    throw new Error("PLAID_LIVE_POSTGRES_URL must be a non-empty PostgreSQL connection string");
+  }
   const pool = new Pool({ connectionString: cfg.connectionString });
 
   async function bindAccount(input: {
@@ -316,13 +333,17 @@ export function createSyncPostgresStore(cfg: SyncPostgresConfig): ProviderSyncSt
 
   async function listActiveObservations(accountBindingId: AccountBindingId): Promise<PersistedObservation[]> {
     const res = await pool.query(
-      `SELECT id, account_binding_id, amount_cents, direction, status, qualification_balance_cents, last_reconciled_cycle_id, first_observed_at, posted_at, description, normalization_version, state, predecessor_observation_id, created_at, updated_at
-         FROM ${T_OBSERVATIONS} WHERE account_binding_id = $1 AND state = 'active' ORDER BY created_at`,
+      `SELECT o.id, o.account_binding_id, r.external_ref, o.amount_cents, o.direction, o.status, o.qualification_balance_cents, o.last_reconciled_cycle_id, o.first_observed_at, o.posted_at, o.description, o.normalization_version, o.state, o.predecessor_observation_id, o.created_at, o.updated_at
+         FROM ${T_OBSERVATIONS} o
+         LEFT JOIN ${T_REFS} r
+           ON r.financial_observation_id = o.id AND r.account_binding_id = o.account_binding_id
+        WHERE o.account_binding_id = $1 AND o.state = 'active' ORDER BY o.created_at`,
       [accountBindingId]
     );
     return res.rows.map((row) => ({
       id: row.id as FinancialObservationId,
       accountBindingId: row.account_binding_id as AccountBindingId,
+      externalRef: row.external_ref as ExternalObservationRef,
       amountCents: Number(row.amount_cents),
       direction: row.direction,
       status: row.status,

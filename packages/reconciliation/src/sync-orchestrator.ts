@@ -23,9 +23,9 @@
 // SECURITY: no credentials are read, returned, or stored here. The provider's
 // `credentialRef` is opaque and only ever forwarded from a binding.
 
-import type { ObservationSyncDelta } from "@alepes/domain";
+import type { ObservationSyncDelta, FinancialObservationId } from "@alepes/domain";
 import type { AccountBinding, FinancialDataProvider } from "@alepes/integration-runtime";
-import type { AccountBindingId, ProviderSyncStore, SyncCycleId } from "@alepes/persistence";
+import type { AccountBindingId, ProviderSyncStore, ReconcileSyncCycleResult, SyncCycleId } from "@alepes/persistence";
 
 export interface SyncRun {
   /** The reconciled full-cycle delta persisted (all pages merged). */
@@ -34,6 +34,8 @@ export interface SyncRun {
   finalCursor: string;
   /** Number of provider pages fetched to complete the cycle. */
   pages: number;
+  /** IDs of observations freshly added in this cycle (Alepes-minted FinancialObservationId from reconcile). */
+  addedObservationIds: FinancialObservationId[];
 }
 
 export interface SyncOrchestratorOptions {
@@ -51,6 +53,9 @@ function mergeDelta(acc: ObservationSyncDelta, page: ObservationSyncDelta): Obse
     added: [...acc.added, ...page.added],
     modified: [...acc.modified, ...page.modified],
     removed: [...acc.removed, ...page.removed],
+    // Preserve the latest available account snapshot: later pages win when present;
+    // otherwise carry forward the accumulator's snapshot. Never fabricates one.
+    accountBalance: page.accountBalance ?? acc.accountBalance ?? undefined,
     nextCursor: page.nextCursor, // the FINAL page's cursor wins; intermediate ones are discarded
     hasMore: page.hasMore,
   };
@@ -126,12 +131,13 @@ export async function syncAccount(
   // cursor to the final page's cursor. Pass the starting cursor so the store can
   // reject this cycle as stale if a concurrent cycle already advanced it. Only
   // now is anything persisted.
-  await store.reconcileSyncCycle({
+  const reconcileResult = await store.reconcileSyncCycle({
     accountBindingId: persistedBindingId,
     delta: {
       added: acc.added,
       modified: acc.modified,
       removed: acc.removed,
+      accountBalance: acc.accountBalance,
       nextCursor: acc.nextCursor,
       hasMore: false,
     },
@@ -141,7 +147,7 @@ export async function syncAccount(
     normalizationVersion: opts.normalizationVersion,
   });
 
-  return { delta: acc, finalCursor: acc.nextCursor, pages };
+  return { delta: acc, finalCursor: acc.nextCursor, pages, addedObservationIds: reconcileResult.added };
 }
 
 function isRestartSync(err: Error): boolean {

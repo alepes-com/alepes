@@ -58,6 +58,7 @@ function makePlan(input: {
   ruleVersionId: string;
   portfolioVersionId?: string;
   hash?: string;
+  executionMode?: "shadow" | "execute";
 }): PersistableExecutionPlan {
   return {
     id: `p_${ulid()}` as PersistenceId,
@@ -71,6 +72,7 @@ function makePlan(input: {
     inputSnapshotHash: input.hash ?? `fake-hash-for-${input.cashEventId}`,
     deployableCents: nonNegativeCents(600_00),
     disposition: "shadow",
+    executionMode: input.executionMode ?? "shadow",
   };
 }
 
@@ -212,8 +214,8 @@ runIntegration("persistence integration (real PostgreSQL)", () => {
 
       // Insert the plan
       await client.query(
-        `INSERT INTO ${PLANS} (id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        `INSERT INTO ${PLANS} (id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition, execution_mode)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
           plan.id,
           plan.userId,
@@ -225,6 +227,7 @@ runIntegration("persistence integration (real PostgreSQL)", () => {
           plan.inputSnapshotHash,
           plan.deployableCents,
           plan.disposition,
+          plan.executionMode,
         ]
       );
 
@@ -295,5 +298,261 @@ runIntegration("persistence integration (real PostgreSQL)", () => {
     } finally {
       await pool.end();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #6 remediation — Finding 2 (P1): historical plan immutability.
+//
+// migration 0007 rebuilds `execution_plans_lifecycle_guard`. Every column of
+// execution_plans EXCEPT `disposition` (the lifecycle column) is immutable
+// after creation: ownership (user_id, portfolio_id) and the recorded plan
+// (plan_data) are history, not editable state. `user_id` and `plan_data` are
+// nullable, so the guard MUST use null-safe comparison — a plain `<>` chain
+// silently accepts NULL→value and value→NULL rewrites.
+//
+// The nine F2-* tests below map 1:1 to the required database tests from the
+// remediation card; F2-10 is an additional null-safety probe.
+// ---------------------------------------------------------------------------
+runIntegration("execution_plans historical immutability (migration 0007 lifecycle guard)", () => {
+  const GUARD_ERROR = /immutable after creation/;
+
+  async function savePlanFor(tag: string) {
+    const repo = ports!;
+    const cashEventId = `ce-f2-${tag}-${ulid()}`;
+    const plan = makePlan({
+      cashEventId,
+      ruleVersionId: `rv-f2-${tag}`,
+      portfolioVersionId: `pv-f2-${tag}`,
+      hash: `hash-f2-${tag}`,
+    });
+    const id = await repo.execution.savePlan(plan);
+    return { id, plan };
+  }
+
+  // Raw insert so we can create rows the app layer would never produce
+  // (user_id NULL, plan_data NULL) to prove null-safe comparison.
+  async function insertRawPlan(
+    id: string,
+    overrides: { userId?: string | null; planData?: string | null } = {}
+  ) {
+    const { Pool } = await import("pg");
+    const pool = new Pool({ connectionString: TEST_CONNECTION });
+    try {
+      await pool.query(
+        `INSERT INTO ${PLANS} (id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id, calculation_version, input_snapshot_hash, deployable_cents, disposition, execution_mode, plan_data)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [
+          id,
+          overrides.userId ?? null,
+          "portfolio-test",
+          `ce-raw-${id}`,
+          `rv-raw-${id}`,
+          `pv-raw-${id}`,
+          `cv-raw-${id}`,
+          `hash-raw-${id}`,
+          100_00,
+          "shadow",
+          "shadow",
+          overrides.planData ?? null,
+        ]
+      );
+    } finally {
+      await pool.end();
+    }
+  }
+
+  async function readHistoricalRow(id: string) {
+    const { Pool } = await import("pg");
+    const pool = new Pool({ connectionString: TEST_CONNECTION });
+    try {
+      const res = await pool.query(
+        `SELECT id, user_id, portfolio_id, cash_event_id, rule_version_id, portfolio_version_id,
+                calculation_version, input_snapshot_hash, deployable_cents::text AS deployable_cents,
+                disposition, execution_mode, plan_data::text AS plan_data, created_at::text AS created_at
+           FROM ${PLANS} WHERE id = $1`,
+        [id]
+      );
+      return res.rows[0];
+    } finally {
+      await pool.end();
+    }
+  }
+
+  // Attempt an UPDATE and report whether the guard rejected it. Never throws,
+  // so the assertion below can present the real outcome (accepted vs rejected)
+  // in the failure message.
+  async function attempt(sql: string, params: unknown[] = []) {
+    const { Pool } = await import("pg");
+    const pool = new Pool({ connectionString: TEST_CONNECTION });
+    try {
+      const res = await pool.query(sql, params);
+      return { rejected: false as const, rowCount: res.rowCount ?? 0 };
+    } catch (err) {
+      return {
+        rejected: true as const,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      await pool.end();
+    }
+  }
+
+  beforeAll(async () => {
+    await cleanDb();
+  });
+
+  beforeEach(async () => {
+    const { Pool } = await import("pg");
+    const pool = new Pool({ connectionString: TEST_CONNECTION });
+    await pool.query(`TRUNCATE ${EVENTS}, ${ORDERS}, ${PLANS}, ${OUTBOX} RESTART IDENTITY CASCADE`);
+    await pool.end();
+  });
+
+  it("F2-1 changing user_id is rejected", async () => {
+    const { id } = await savePlanFor("t1");
+    const result = await attempt(`UPDATE ${PLANS} SET user_id = 'attacker' WHERE id = $1`, [id]);
+    expect(result, `historical ownership (user_id) must be immutable; got: ${JSON.stringify(result)}`)
+      .toEqual(expect.objectContaining({ rejected: true, message: expect.stringMatching(GUARD_ERROR) }));
+  });
+
+  it("F2-2 changing portfolio_id is rejected", async () => {
+    const { id } = await savePlanFor("t2");
+    const result = await attempt(`UPDATE ${PLANS} SET portfolio_id = 'rogue-portfolio' WHERE id = $1`, [id]);
+    expect(result, `historical ownership (portfolio_id) must be immutable; got: ${JSON.stringify(result)}`)
+      .toEqual(expect.objectContaining({ rejected: true, message: expect.stringMatching(GUARD_ERROR) }));
+  });
+
+  it("F2-3 changing plan_data is rejected", async () => {
+    const { id } = await savePlanFor("t3");
+    const result = await attempt(
+      `UPDATE ${PLANS} SET plan_data = '{"tampered":true}'::jsonb WHERE id = $1`,
+      [id]
+    );
+    expect(result, `recorded plan contents (plan_data) must be immutable; got: ${JSON.stringify(result)}`)
+      .toEqual(expect.objectContaining({ rejected: true, message: expect.stringMatching(GUARD_ERROR) }));
+  });
+
+  it("F2-4 combined user_id + portfolio_id + plan_data mutation is rejected", async () => {
+    const { id } = await savePlanFor("t4");
+    const result = await attempt(
+      `UPDATE ${PLANS} SET user_id = 'attacker', portfolio_id = 'rogue-portfolio', plan_data = '{"tampered":true}'::jsonb WHERE id = $1`,
+      [id]
+    );
+    expect(result, `combined historical mutation must be immutable; got: ${JSON.stringify(result)}`)
+      .toEqual(expect.objectContaining({ rejected: true, message: expect.stringMatching(GUARD_ERROR) }));
+  });
+
+  it("F2-5 mutation without a disposition change is rejected", async () => {
+    const { id } = await savePlanFor("t5");
+    // disposition is explicitly re-asserted at its current value ('shadow'):
+    // framing the UPDATE as disposition maintenance must not smuggle content.
+    const result = await attempt(
+      `UPDATE ${PLANS} SET plan_data = '{"smuggled":true}'::jsonb, disposition = 'shadow' WHERE id = $1`,
+      [id]
+    );
+    expect(result, `mutation with unchanged disposition must be rejected; got: ${JSON.stringify(result)}`)
+      .toEqual(expect.objectContaining({ rejected: true, message: expect.stringMatching(GUARD_ERROR) }));
+  });
+
+  it("F2-6 mutation smuggled alongside a permitted disposition change is rejected", async () => {
+    const { id } = await savePlanFor("t6");
+    // disposition 'shadow' -> 'executed' alone would be permitted; the
+    // plan_data rewrite in the same statement must still fail the guard.
+    const result = await attempt(
+      `UPDATE ${PLANS} SET plan_data = '{"smuggled":true}'::jsonb, disposition = 'executed' WHERE id = $1`,
+      [id]
+    );
+    expect(result, `historical mutation must not ride along a lifecycle transition; got: ${JSON.stringify(result)}`)
+      .toEqual(expect.objectContaining({ rejected: true, message: expect.stringMatching(GUARD_ERROR) }));
+  });
+
+  it("F2-7 a legitimate lifecycle transition (disposition-only change) is accepted", async () => {
+    const { id } = await savePlanFor("t7");
+    const before = await readHistoricalRow(id);
+
+    // The real production path for lifecycle transitions.
+    await ports!.execution.updateDisposition(id as PersistenceId, "executed");
+
+    const after = await readHistoricalRow(id);
+    expect(after.disposition).toBe("executed");
+    // Everything except disposition is untouched.
+    expect({ ...after, disposition: undefined }).toEqual({ ...before, disposition: undefined });
+  });
+
+  it("F2-8 a legitimate no-op disposition update is accepted", async () => {
+    const { id } = await savePlanFor("t8"); // disposition starts at 'shadow'
+    const before = await readHistoricalRow(id);
+
+    const result = await attempt(`UPDATE ${PLANS} SET disposition = 'shadow' WHERE id = $1`, [id]);
+    expect(result, `no-op disposition update must stay accepted; got: ${JSON.stringify(result)}`)
+      .toEqual({ rejected: false, rowCount: 1 });
+
+    expect(await readHistoricalRow(id)).toEqual(before);
+  });
+
+  it("F2-9 rejected updates leave the historical row unchanged", async () => {
+    const { id } = await savePlanFor("t9");
+    const before = await readHistoricalRow(id);
+
+    const battery: Array<[string, unknown[]]> = [
+      [`UPDATE ${PLANS} SET user_id = 'attacker' WHERE id = $1`, [id]],
+      [`UPDATE ${PLANS} SET portfolio_id = 'rogue-portfolio' WHERE id = $1`, [id]],
+      [`UPDATE ${PLANS} SET plan_data = '{"tampered":true}'::jsonb WHERE id = $1`, [id]],
+      [
+        `UPDATE ${PLANS} SET user_id = 'attacker', portfolio_id = 'rogue-portfolio', plan_data = '{"tampered":true}'::jsonb WHERE id = $1`,
+        [id],
+      ],
+      // Regression pin: columns the guard already covered pre-fix stay covered.
+      [`UPDATE ${PLANS} SET deployable_cents = 99999 WHERE id = $1`, [id]],
+      [`UPDATE ${PLANS} SET cash_event_id = 'ce-hijacked' WHERE id = $1`, [id]],
+      [`UPDATE ${PLANS} SET created_at = now() WHERE id = $1`, [id]],
+      [`UPDATE ${PLANS} SET execution_mode = 'execute' WHERE id = $1`, [id]],
+      [
+        `UPDATE ${PLANS} SET plan_data = '{"smuggled":true}'::jsonb, disposition = 'executed' WHERE id = $1`,
+        [id],
+      ],
+    ];
+    for (const [sql, params] of battery) {
+      const result = await attempt(sql, params);
+      expect(
+        { sql, result },
+        `prohibited historical mutation must be rejected: ${sql}`
+      ).toEqual(expect.objectContaining({ result: expect.objectContaining({ rejected: true }) }));
+    }
+
+    const after = await readHistoricalRow(id);
+    expect(after, `row must be byte-identical after the rejected battery`).toEqual(before);
+  });
+
+  it("F2-10 null-safe comparison: NULL↔value transitions on nullable historical fields are rejected", async () => {
+    const nullRowId = `p-f2-null-${ulid()}`;
+    await insertRawPlan(nullRowId); // user_id NULL, plan_data NULL
+
+    const nullToUser = await attempt(`UPDATE ${PLANS} SET user_id = 'attacker' WHERE id = $1`, [nullRowId]);
+    expect(nullToUser, `NULL user_id -> 'attacker' must be rejected (null-safe compare); got: ${JSON.stringify(nullToUser)}`)
+      .toEqual(expect.objectContaining({ rejected: true, message: expect.stringMatching(GUARD_ERROR) }));
+
+    const nullToPlan = await attempt(`UPDATE ${PLANS} SET plan_data = '{"tampered":true}'::jsonb WHERE id = $1`, [nullRowId]);
+    expect(nullToPlan, `NULL plan_data -> value must be rejected (null-safe compare); got: ${JSON.stringify(nullToPlan)}`)
+      .toEqual(expect.objectContaining({ rejected: true, message: expect.stringMatching(GUARD_ERROR) }));
+
+    const { id } = await savePlanFor("t10"); // user_id 'test-user', plan_data '{}'
+    const userToNull = await attempt(`UPDATE ${PLANS} SET user_id = NULL WHERE id = $1`, [id]);
+    expect(userToNull, `'test-user' -> NULL must be rejected (null-safe compare); got: ${JSON.stringify(userToNull)}`)
+      .toEqual(expect.objectContaining({ rejected: true, message: expect.stringMatching(GUARD_ERROR) }));
+
+    const planToNull = await attempt(`UPDATE ${PLANS} SET plan_data = NULL WHERE id = $1`, [id]);
+    expect(planToNull, `plan_data -> NULL must be rejected (null-safe compare); got: ${JSON.stringify(planToNull)}`)
+      .toEqual(expect.objectContaining({ rejected: true, message: expect.stringMatching(GUARD_ERROR) }));
+
+    // Control: a NULL-historical row may still undergo a legitimate
+    // disposition transition (NULL stays NULL; nothing historical moves).
+    const lifecycle = await attempt(
+      `UPDATE ${PLANS} SET disposition = 'approval_required' WHERE id = $1`,
+      [nullRowId]
+    );
+    expect(lifecycle, `legitimate transition on a NULL-historical row must stay accepted; got: ${JSON.stringify(lifecycle)}`)
+      .toEqual({ rejected: false, rowCount: 1 });
   });
 });

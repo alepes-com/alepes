@@ -21,6 +21,21 @@ export interface Ports {
  * The form of a plan that's ready to be persisted. This is the domain's
  * ExecutionPlan plus the provenance needed to reproduce it later.
  */
+/**
+ * Outbox-driven execution mode. Discrete from `disposition` — disposition is
+ * the lifecycle state of the plan (which may later transition through
+ * approval_required/approved/etc.); executionMode is the producer's explicit
+ * declaration of what the outbox event is authorized to drive:
+ *
+ *   "shadow"  — simulate only; NEVER submit real orders.
+ *   "execute" — authorized to submit real orders via the brokerage capability.
+ *
+ * This is REQUIRED at savePlan time and is never derived from the lifecycle
+ * disposition, because mapping "anything not shadow" -> "execute" is not
+ * fail-closed. For v0.5 certification, executionMode MUST be "shadow".
+ */
+export type OutboxExecutionMode = "shadow" | "execute";
+
 export interface PersistableExecutionPlan {
   /** The in-memory domain plan (the actual decisions). */
   plan: ExecutionPlan;
@@ -47,6 +62,12 @@ export interface PersistableExecutionPlan {
   deployableCents: NonNegativeCents;
   /** Lifecycle disposition at creation time. */
   disposition: PersistableDisposition;
+  /**
+   * Explicit execution authorization for the outbox event. REQUIRED — no
+   * implicit default. `savePlan` throws on any value other than the two
+   * typed literals. See `OutboxExecutionMode` for the contract.
+   */
+  executionMode: OutboxExecutionMode;
 }
 
 /**
@@ -123,6 +144,22 @@ export interface OutboxRepository {
    * Returns the claimed rows including the lease expiry.
    */
   claimPending(limit: number, leaseMs: number): Promise<OutboxClaim[]>;
+
+  /**
+   * Bounded, certification-safe claim of exactly ONE outbox row by its id.
+   *
+   * Used by certification-style publishers that must prove a SPECIFIC event
+   * reached `delivered_at IS NOT NULL` without ever touching unrelated pending
+   * rows. Unlike `claimPending(limit, leaseMs)`, this:
+   *
+   *   - targets exactly one row (no created_at-ordered sweep),
+   *   - throws (and claims nothing) when the row is already delivered, missing,
+   *     or currently held under a non-expired lease by another worker,
+   *   - is the ONLY outbox claim a bounded certification harness may use.
+   *
+   * Returns the single claimed row.
+   */
+  claimPendingById(id: PersistenceId, leaseMs: number): Promise<OutboxClaim>;
 
   /**
    * Mark a claimed event as delivered (terminal state). After this, the event

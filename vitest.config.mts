@@ -13,10 +13,14 @@ const packages = [
   "allocation-engine",
   "rules-engine",
   "execution-policy",
+  "certification-guards",
   "integration-runtime",
   "persistence",
   "reconciliation",
   "temporal-workflows",
+  "audit",
+  "reporting",
+  "observability",
 ];
 const alias: Record<string, string> = {
   "@": path.resolve(dirname, "./src"),
@@ -44,6 +48,19 @@ alias["@alepes/plaid-financial-data"] = path.resolve(
 alias["@alepes/alpaca-brokerage-data"] = path.resolve(
   dirname,
   "./packages/integrations/alpaca-brokerage-data/src/index.ts"
+);
+// Deeper subpath aliases (packages exporting more than just src/index.ts).
+alias["@alepes/temporal-workflows/worker"] = path.resolve(
+  dirname,
+  "./packages/temporal-workflows/src/worker.ts"
+);
+alias["@alepes/temporal-workflows/certification-preflight"] = path.resolve(
+  dirname,
+  "./packages/temporal-workflows/src/certification-preflight.ts"
+);
+alias["@alepes/temporal-workflows/source-provenance"] = path.resolve(
+  dirname,
+  "./packages/temporal-workflows/src/source-provenance.ts"
 );
 
 export default defineConfig({

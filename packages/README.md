@@ -15,7 +15,7 @@ AllocationPlan                   (where to deploy — drift correction)
    ↓  @alepes/execution-policy
 ExecutionPlan  →  ExecutionPolicy  →  Shadow | Approval | Execute
    ↓  @alepes/integration-runtime (capabilities)
-MockBrokerage / (future: real brokerage)
+@alepes/alpaca-brokerage-data (paper | sandbox | live)
    ↓
 AuditRecord[] (reproducible, explains every decision)
 ```
@@ -40,6 +40,7 @@ construction (orders are always `buy`, never `sell`).
 | `@alepes/reconciliation` | Provider-neutral sync orchestration + Shadow Mode composition (sync → reconcile → interpret → qualify → shadow disposition). |
 | `@alepes/temporal-workflows` | Temporal orchestration layer (ExecutionPlanWorkflow + OutboxPublisherWorkflow). |
 | `@alepes/analytics` | Read-only analytics over PostgreSQL (provider-neutral `AnalyticsEngine`; never moves money). |
+| `@alepes/alpaca-brokerage-data` | Alpaca brokerage read-only adapter (paper, sandbox, live). |
 
 ## Boundary discipline
 
@@ -81,6 +82,42 @@ Additional suites:
   every amount ≥ 0, sum ≤ deployable, sum === deployable when fully allocatable.
 - `packages/integration-conformance/src/conformance.ts` — reusable certification
   harness; certify any bank/brokerage plugin against its capability contract.
+
+## Alpaca live read-only certification (first-hand, live trading only)
+
+The Alpaca brokerage-data adapter (`packages/integrations/alpaca-brokerage-data`)
+supports three environments: `paper`, `sandbox`, and `live`. A separate,
+standalone harness proves the **same adapter** against real Alpaca LIVE responses —
+the evidence gate for the `v0.4.0` real-account Shadow Mode milestone. It is
+deliberately NOT part of CI and NOT a Vitest suite, because it requires live
+credentials.
+
+Run it with:
+
+```bash
+ALEPES_ALPACA_ENV=live \
+ALEPES_ALPACA_LIVE_KEY=<live key id> \
+ALEPES_ALPACA_LIVE_SECRET=<live secret> \
+bun run certify:alpaca-live
+```
+
+The 11-gate harness:
+
+1. refuses to run unless `ALEPES_ALPACA_ENV` is exactly `live` (never paper/sandbox);
+2. authenticates with live credentials without printing them;
+3. reads the exact live account and fingerprints its provider ID;
+4. reads live cash / buying-power / account status;
+5. reads real live positions;
+6. normalizes quantities and monetary values without JS-float authoritative money;
+7. reads prices for those positions;
+8. constructs the provider-neutral PortfolioState via brokerage-shadow bridge;
+9. runs the FULL Observe→Decide→Validate→Shadow pipeline on a synthetic
+   qualifying deposit, producing ONLY shadow decisions (zero orders);
+10. proves no submitOrders capability is registered or reachable;
+11. produces no live orders, transfers, or brokerage mutations.
+
+Credentials never touch git, shell history, or the report: source them from an
+environment/secrets mechanism and keep them out of the repo.
 
 ## Plaid Sandbox certification (first-hand, live Sandbox only)
 

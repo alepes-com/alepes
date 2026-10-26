@@ -20,6 +20,7 @@ import type {
   FinancialObservationId,
   ObservationSyncDelta,
 } from "@alepes/domain";
+import type { NonNegativeCents } from "@alepes/money";
 import type { AccountBinding, FinancialDataProvider } from "@alepes/integration-runtime";
 import { ProviderError } from "@alepes/integration-runtime";
 import { syncAccount } from "./sync-orchestrator";
@@ -65,7 +66,7 @@ function scriptedProvider(pages: ObservationSyncDelta[]): FinancialDataProvider 
     async bindAccount() { return {} as AccountBinding; },
     async syncObservations(_binding, _cursor) {
       if (fetchCount < pages.length) return pages[fetchCount++];
-      throw new Error("scripted provider exhausted");
+      throw new ProviderError("unknown", "provider exhausted");
     },
   };
 }
@@ -225,5 +226,130 @@ describe("sync orchestrator — intermediate pagination cursors never authoritat
     expect(addedRefs).toEqual(["t1" as ExternalObservationRef, "t2" as ExternalObservationRef, "t3" as ExternalObservationRef]);
     expect(store.checkpoint?.cursor).toBe("C3");
     expect(run.finalCursor).toBe("C3");
+  });
+
+  // ── Balance mergeDelta: prove it passes accountBalance through to reconcile ───
+  it("reconcileSyncCycle input should carry forward balance from single-page sync", async () => {
+    const store = new FakeStore();
+    store.checkpoint = { cursor: "" };
+
+    // Build pages where the adapter returns accountBalance.
+    // Test validates: the bug was mergeDelta dropping balance; now it's preserved.
+    const pageWithBalance: ObservationSyncDelta = {
+      added: [obs("t1")],
+      modified: [],
+      removed: [],
+      nextCursor: "C1",
+      hasMore: false,
+      // Balance is present atomic to this call, but should be checked by mergeDelta
+      accountBalance: {
+        accountBindingId: "b" as const as any, // binding identifier
+        currentCents: 10000 as NonNegativeCents,
+        capturedAt: "2026-09-14T20:00:00Z",
+        isCachedByProvider: true,
+        normalizationVersion: "norm@1",
+      },
+    };
+
+    const provider = scriptedProvider([pageWithBalance]);
+
+    const run = await syncAccount(provider, store, binding, persistedBindingId, {
+      newCycleId,
+      normalizationVersion: "norm@1",
+    });
+
+    expect(store.reconcileCalls).toHaveLength(1);
+    // mergeDelta must propagate the balance from page into the committed cycle
+    expect(store.reconcileCalls[0].delta.accountBalance).toBeTruthy();
+    expect(store.reconcileCalls[0].delta.accountBalance?.currentCents).toBe(10000);
+  });
+
+  it("reconcileSyncCycle input should carry forward balance from multi-page sync (latest-wins)", async () => {
+    const store = new FakeStore();
+    store.checkpoint = { cursor: "" };
+
+    const provider = scriptedProvider([
+      { ...page("C1", true, ["t1"]), accountBalance: { accountBindingId: "b" as const as any, currentCents: 4200 as NonNegativeCents, capturedAt: "2026-09-14T20:00:00Z", isCachedByProvider: true, normalizationVersion: "norm@1" } },
+      { ...page("C2", false, ["t2"]), accountBalance: { accountBindingId: "b" as const as any, currentCents: 99900 as NonNegativeCents, capturedAt: "2026-09-14T20:00:00Z", isCachedByProvider: true, normalizationVersion: "norm@1" } },
+    ]);
+
+    await syncAccount(provider, store, binding, persistedBindingId, {
+      newCycleId,
+      normalizationVersion: "norm@1",
+    });
+
+    expect(store.reconcileCalls).toHaveLength(1);
+    expect(store.reconcileCalls[0].delta.accountBalance?.currentCents).toBe(99900);
+  });
+
+  it("reconcileSyncCycle input should carry forward earlier balance when later page lacks one", async () => {
+    const store = new FakeStore();
+    store.checkpoint = { cursor: "" };
+
+    const provider = scriptedProvider([
+      { ...page("C1", true, ["t1"]), accountBalance: { accountBindingId: "b" as const as any, currentCents: 4200 as NonNegativeCents, capturedAt: "2026-09-14T20:00:00Z", isCachedByProvider: true, normalizationVersion: "norm@1" } },
+      page("C2", false, ["t2"]), // no balance on final page
+    ]);
+
+    await syncAccount(provider, store, binding, persistedBindingId, {
+      newCycleId,
+      normalizationVersion: "norm@1",
+    });
+
+    expect(store.reconcileCalls).toHaveLength(1);
+    expect(store.reconcileCalls[0].delta.accountBalance?.currentCents).toBe(4200);
+  });
+
+  it("restart_sync: discarded page's balance doesn't leak into the committed cycle", async () => {
+    const store = new FakeStore();
+    store.checkpoint = { cursor: "C0" };
+
+    // Abandoned start carries balance 99900; after restart pages rebuild without it.
+    const first = {
+      ...page("C1", true, ["t1"]),
+      accountBalance: { accountBindingId: "b" as AccountBindingId, capturedAt: "2026-09-14T20:00:00Z", currentCents: 99900 as NonNegativeCents, isCachedByProvider: true, normalizationVersion: "norm@1" },
+    };
+    const events: Array<ObservationSyncDelta | "restart"> = [
+      first,
+      "restart",
+      page("C1", true, ["t1"]), // no balance on rebuilt pages
+      page("C2", false, ["t2"]), // no balance
+    ];
+    let i = 0;
+    const provider: FinancialDataProvider = {
+      info: { id: "scripted", version: "1.0.0" },
+      async discoverAccounts() { return []; },
+      async bindAccount() { return {} as AccountBinding; },
+      async syncObservations() {
+        const e = events[i++];
+        if (e === "restart") throw new ProviderError("restart_sync", "mutation detected");
+        return e;
+      },
+    };
+
+    const run = await syncAccount(provider, store, binding, persistedBindingId, {
+      newCycleId,
+      normalizationVersion: "norm@1",
+    });
+
+    // The abandoned page's balance (99900) must NOT leak into the committed cycle.
+    expect(store.reconcileCalls).toHaveLength(1);
+    expect(store.reconcileCalls[0].delta.accountBalance).toBeUndefined();
+    expect(run.finalCursor).toBe("C2");
+  });
+
+  it("no balance anywhere: reconcile receives an undefined accountBalance", async () => {
+    const store = new FakeStore();
+    store.checkpoint = { cursor: "" };
+
+    const provider = scriptedProvider([page("C1", false, ["t1"])]);
+
+    await syncAccount(provider, store, binding, persistedBindingId, {
+      newCycleId,
+      normalizationVersion: "norm@1",
+    });
+
+    expect(store.reconcileCalls).toHaveLength(1);
+    expect(store.reconcileCalls[0].delta.accountBalance).toBeUndefined();
   });
 });

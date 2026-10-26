@@ -239,6 +239,22 @@ function normalizeAccountBalance(
  * "transactions data mutated during pagination" is surfaced as `restart_sync` so
  * the orchestrator restarts from the original cycle cursor.
  */
+function plaidStructuredErrorFields(err: unknown): {
+  error_type?: string;
+  error_code?: string;
+  request_id?: string;
+} | undefined {
+  const data = (err as { response?: { data?: unknown } })?.response?.data;
+  if (typeof data !== "object" || data === null) return undefined;
+  const out: { error_type?: string; error_code?: string; request_id?: string } = {};
+  const d = data as Record<string, unknown>;
+  if (typeof d.error_type === "string") out.error_type = d.error_type;
+  if (typeof d.error_code === "string") out.error_code = d.error_code;
+  if (typeof d.request_id === "string") out.request_id = d.request_id;
+  // Only return if at least one field is present; avoid { undefined, undefined, undefined }
+  return out.error_type || out.error_code || out.request_id ? out : undefined;
+}
+
 function classifyPlaidError(err: unknown): ProviderError {
   const message = err instanceof Error ? err.message : String(err);
   // Plaid's PRODUCT_NOT_READY / recently-mutated data maps to restart_sync.
@@ -246,11 +262,16 @@ function classifyPlaidError(err: unknown): ProviderError {
     return new ProviderError("restart_sync", message);
   }
   const status = (err as { response?: { status?: number } })?.response?.status;
-  if (status === 401 || status === 403) return new ProviderError("auth", message);
-  if (status === 429) return new ProviderError("rate_limited", message);
-  if (status === 404) return new ProviderError("not_found", message);
-  if (typeof status === "number" && status >= 500) return new ProviderError("provider_unavailable", message);
-  return new ProviderError("unknown", message);
+  const fields = plaidStructuredErrorFields(err);
+  const enrich = fields
+    ? ` [type=${fields.error_type} code=${fields.error_code} request_id=${fields.request_id}]`
+    : "";
+  if (status === 401 || status === 403) return new ProviderError("auth", message + enrich);
+  if (status === 429) return new ProviderError("rate_limited", message + enrich);
+  if (status === 404) return new ProviderError("not_found", message + enrich);
+  if (typeof status === "number" && status >= 500)
+    return new ProviderError("provider_unavailable", message + enrich);
+  return new ProviderError("unknown", message + enrich);
 }
 
 // ─── Deterministic fixtures (for conformance + e2e tests) ────────────────────
