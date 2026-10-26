@@ -251,10 +251,27 @@ export function reconstructRun(
     ? { disposition: executionPolicyEvent.payload.disposition, executeCount: executionPolicyEvent.payload.executeCount }
     : null;
 
-  // Shadow-only invariant
+  // Shadow-only invariant. A run is shadow-only when its persisted event history
+  // proves all three legs of the Shadow Mode zero-order guarantee:
+  //   1. SHADOW_DECISION_RECORDED (succeeded) — the pipeline chose shadow.
+  //   2. EXECUTION_BLOCKED — the deliberate block. The producer
+  //      (recordExecutionBlocked) emits this with status "failed": the block IS
+  //      the outcome, and its payload (executeCount 0, orderCount 0, ...) is the
+  //      authoritative zero-order evidence. Match it status-agnostically via
+  //      firstOfType — like CERT_GATE_FAILED / PROVIDER_REQUEST_FAILED — never
+  //      treating the expected block as an order failure or evidence of execution.
+  //   3. EXECUTION_POLICY_EVALUATED (succeeded) with disposition "shadow" and
+  //      executeCount 0 — the policy evidence corroborates the block. A block
+  //      recorded beside a policy that planned real orders is contradictory
+  //      evidence and must never attest shadow-only.
   const shadowDecision = firstSucceededOfType(events, "SHADOW_DECISION_RECORDED");
-  const executionBlocked = firstSucceededOfType(events, "EXECUTION_BLOCKED");
-  const shadowOnly = !!shadowDecision && !!executionBlocked;
+  const executionBlocked = firstOfType(events, "EXECUTION_BLOCKED");
+  const shadowOnly =
+    !!shadowDecision &&
+    !!executionBlocked &&
+    !!executionPolicy &&
+    executionPolicy.disposition === "shadow" &&
+    executionPolicy.executeCount === 0;
 
   // Provider mutation attempted
   const providerMutationAttempted = run.mutationCounts.providerMutation > 0;
