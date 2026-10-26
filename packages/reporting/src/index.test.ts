@@ -11,6 +11,7 @@ import type {
   GateResult,
   EvidenceKind,
   RunResult,
+  FailureCode,
 } from "@alepes/audit";
 import type { ProviderCallEvidence } from "@alepes/reporting";
 import {
@@ -20,6 +21,35 @@ import {
   renderConsoleSummary,
   type CertificationReportV1,
 } from "@alepes/reporting";
+import { ulid } from "@alepes/persistence";
+import type {
+  AuditPorts,
+  CreateCertificationRunInput,
+  CompleteCertificationRunInput,
+  PersistedCertificationRun,
+} from "@alepes/persistence";
+// The actual audit-store helpers (pure module: no Plaid SDK, no network — only
+// deterministic event emission). Imported directly so the tests generate
+// events with the SAME producers certify-live.ts uses, not hand-built fixtures.
+import {
+  startRun,
+  recordPreflight,
+  recordProviderRequest,
+  recordObservationReceived,
+  recordObservationNormalized,
+  recordObservationPersisted,
+  recordCashEventQualified,
+  recordRuleEvaluated,
+  recordCapitalPlanCreated,
+  recordAllocationPlanCreated,
+  recordExecutionPolicyEvaluated,
+  recordShadowDecisionRecorded,
+  recordExecutionBlocked,
+  recordGate,
+  completeRun,
+  type CertifyLiveAuditConfig,
+  type RunContext,
+} from "../../integrations/plaid-financial-data/src/certify-live-audit";
 
 // ─── Helper: branded cents constructors ───
 
@@ -986,5 +1016,501 @@ describe("reconstructRun handles EvidenceBoundary.none correctly", () => {
 
     expect(reconstructed.evidenceKind).toBe("none");
     expect(reconstructed.qualified).toBe(false);
+  });
+});
+
+// ─── F4 regression (PR #6): Shadow-only reconstruction from real producer semantics ───
+//
+// Finding 4 (review of packages/reporting/src/index.ts:255-257 at the pinned
+// head b4f1a421): reconstructRun() required a SUCCEEDED EXECUTION_BLOCKED
+// event, but the actual producer recordExecutionBlocked() emits status
+// "failed" — the block IS the outcome, and its zero-order payload is the
+// authoritative evidence. A correctly blocked Shadow run was therefore
+// misreconstructed as shadowOnly=false.
+//
+// These tests do not hand-build events. They drive the ACTUAL audit-store
+// helpers (packages/integrations/plaid-financial-data/src/certify-live-audit.ts
+// — the same helpers certify-live.ts uses) against an in-memory AuditPorts
+// fake that mirrors the real Postgres adapter's emission contract:
+//   - createRun only stores the run row (CERT_RUN_STARTED is emitted solely by
+//     startRun()'s append, exactly like createAuditPostgresStore);
+//   - completeRun stores the outcome and emits CERT_RUN_COMPLETED with status
+//     "succeeded" (PASS) / "failed" otherwise, inside the same call.
+// Reconstruction input is then read back through the store's own read paths
+// (events.listByRun / providerCalls.listByRun), never from test-local state.
+
+describe("reconstructRun — F4: Shadow-only runs reconstructed from real producer event semantics", () => {
+  type FakeProviderCallRow = Awaited<ReturnType<AuditPorts["providerCalls"]["listByRun"]>>[number];
+
+  // ─── In-memory AuditPorts fake (real adapter parity) ───
+
+  function createFakeAuditPorts(): AuditPorts & {
+    _events: AuditEvent[];
+    _runs: Map<string, PersistedCertificationRun>;
+  } {
+    const runs = new Map<string, PersistedCertificationRun>();
+    const events: AuditEvent[] = [];
+    const providerCalls: FakeProviderCallRow[] = [];
+
+    return {
+      runs: {
+        // Real adapter parity: createRun only INSERTs the run row. It does NOT
+        // emit CERT_RUN_STARTED — startRun()'s explicit append is the sole
+        // producer of that event (see audit-postgres.ts + certify-live-audit.ts).
+        async createRun(input: CreateCertificationRunInput): Promise<void> {
+          const run: PersistedCertificationRun = {
+            runId: input.runId,
+            correlationId: input.correlationId,
+            milestone: input.milestone,
+            provider: input.provider,
+            environment: input.environment,
+            sourceCommit: input.sourceCommit,
+            branch: input.branch ?? null,
+            harness: input.harness,
+            harnessVersion: input.harnessVersion,
+            schemaVersion: input.schemaVersion,
+            startedAt: input.startedAt,
+            completedAt: null,
+            result: null,
+            failureCode: null,
+            evidenceBoundary: {
+              providerObservation: "none",
+              cashEvent: "none",
+              decision: "none",
+              execution: "none",
+              providerMutation: false,
+            },
+            gates: [],
+            mutationCounts: { transfer: 0, order: 0, providerMutation: 0 },
+            finalState: "clean",
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          };
+          runs.set(input.runId, run);
+        },
+        // Real adapter parity: completeRun updates the run and emits
+        // CERT_RUN_COMPLETED (status "succeeded" for PASS, else "failed") in
+        // the same call (see audit-postgres.ts completeRun).
+        async completeRun(input: CompleteCertificationRunInput): Promise<void> {
+          const run = runs.get(input.runId);
+          if (!run) throw new Error(`Run ${input.runId} not found`);
+          run.completedAt = input.completedAt;
+          run.result = input.result;
+          run.failureCode = input.failureCode ?? null;
+          run.evidenceBoundary = input.evidenceBoundary;
+          run.gates = input.gates;
+          run.mutationCounts = input.mutationCounts;
+          run.finalState = input.finalState;
+          run.updatedAt = new Date().toISOString();
+          events.push({
+            eventId: ulid(),
+            runId: input.runId,
+            correlationId: run.correlationId,
+            causationId: undefined,
+            sequence: events.length + 1,
+            occurredAt: input.completedAt,
+            phase: "reporting",
+            type: "CERT_RUN_COMPLETED",
+            status: input.result === "PASS" ? "succeeded" : "failed",
+            actor: "system",
+            provider: undefined,
+            attempt: undefined,
+            mutated: undefined,
+            verified: undefined,
+            payload: { result: input.result, evidenceBoundary: input.evidenceBoundary },
+          } as AuditEvent);
+        },
+        async loadRun(): Promise<PersistedCertificationRun | null> {
+          return null;
+        },
+        async loadRunByCorrelationId(): Promise<PersistedCertificationRun | null> {
+          return null;
+        },
+      },
+      events: {
+        async append(event: AuditEvent): Promise<void> {
+          events.push(event);
+        },
+        async listByRun(runId: string): Promise<AuditEvent[]> {
+          return events.filter(e => e.runId === runId);
+        },
+        async listByCorrelationId(correlationId: string): Promise<AuditEvent[]> {
+          return events.filter(e => e.correlationId === correlationId);
+        },
+      },
+      providerCalls: {
+        async record(input: Parameters<AuditPorts["providerCalls"]["record"]>[0]): Promise<void> {
+          providerCalls.push({
+            evidenceId: input.evidenceId,
+            runId: input.runId,
+            correlationId: input.correlationId,
+            occurredAt: input.occurredAt,
+            operation: input.operation,
+            httpStatus: input.httpStatus ?? null,
+            plaidErrorType: input.plaidErrorType ?? null,
+            plaidErrorCode: input.plaidErrorCode ?? null,
+            plaidRequestId: input.plaidRequestId ?? null,
+            failureCode: input.failureCode ?? null,
+          });
+        },
+        async listByRun(runId: string): Promise<FakeProviderCallRow[]> {
+          return providerCalls.filter(p => p.runId === runId);
+        },
+      },
+      close: async () => {},
+      _events: events,
+      _runs: runs,
+    };
+  }
+
+  /** Normalize the fake store's persisted rows to the reconstruction input type. */
+  function toProviderCallEvidence(rows: FakeProviderCallRow[]): ProviderCallEvidence[] {
+    return rows.map(row => ({
+      evidenceId: row.evidenceId,
+      runId: row.runId,
+      correlationId: row.correlationId,
+      occurredAt: row.occurredAt,
+      operation: row.operation,
+      httpStatus: row.httpStatus ?? undefined,
+      plaidErrorType: row.plaidErrorType ?? undefined,
+      plaidErrorCode: row.plaidErrorCode ?? undefined,
+      plaidRequestId: row.plaidRequestId ?? undefined,
+      failureCode: row.failureCode ?? undefined,
+    }));
+  }
+
+  function synthConfig(ports: AuditPorts): CertifyLiveAuditConfig {
+    return {
+      ports,
+      provider: "plaid",
+      environment: "production",
+      sourceCommit: "b4f1a421",
+      harness: "certify-live.ts",
+      harnessVersion: "audit-cert@1",
+      schemaVersion: "audit-cert@1",
+      milestone: "v0.5.0",
+    };
+  }
+
+  const BLOCK_REASON =
+    "disposition=shadow — Shadow Mode blocks execution by design (zero-order guarantee)";
+
+  const SYNTHETIC_GATES: GateResult[] = [
+    { gate: "preflight", status: "PASS" },
+    { gate: "qualifying_event", status: "PASS" },
+    { gate: "shadow_execution", status: "PASS" },
+  ];
+
+  const SYNTHETIC_SHADOW_BOUNDARY: EvidenceBoundary = {
+    providerObservation: "real",
+    cashEvent: "real",
+    decision: "real",
+    execution: "shadow",
+    providerMutation: false,
+  };
+
+  /**
+   * Drive the ACTUAL audit-store helpers through a complete synthetic Shadow
+   * certification run — the same helper sequence a real certify-live.ts Shadow
+   * run emits (read-only provider sync → qualification → policy pipeline →
+   * shadow decision → execution blocked → gates → completion).
+   */
+  async function driveSyntheticShadowRun(
+    ports: AuditPorts,
+    opts: { policy?: { disposition: "shadow" | "approval" | "execute"; executeCount: number } } = {}
+  ): Promise<RunContext> {
+    const ctx = await startRun(synthConfig(ports));
+    await recordPreflight(ports, ctx, { passed: true, secretsPresent: ["PLAID_CLIENT_ID", "PLAID_SECRET"] });
+    await recordProviderRequest(ports, ctx, "transactions/sync", "started");
+    await recordProviderRequest(ports, ctx, "transactions/sync", "succeeded", { latencyMs: 120 });
+    await recordObservationReceived(ports, ctx, "obs-synth-1", "ext-fp-synth-1", "credit", c(10000), true);
+    await recordObservationNormalized(ports, ctx, "obs-synth-1", "normalize@1");
+    await recordObservationPersisted(ports, ctx, "obs-synth-1", "persist-synth-1");
+    await recordCashEventQualified(ports, ctx, "cash-synth-1", c(10000), "rule-monthly-deposit");
+    await recordRuleEvaluated(ports, ctx, "rule-monthly-deposit", "cash-synth-1", c(10000));
+    await recordCapitalPlanCreated(ports, ctx, "cap-synth-1", nc(10000));
+    await recordAllocationPlanCreated(ports, ctx, "alloc-synth-1", nc(10000), 2);
+    const policy = opts.policy ?? { disposition: "shadow" as const, executeCount: 0 };
+    await recordExecutionPolicyEvaluated(ports, ctx, policy.disposition, policy.executeCount);
+    await recordShadowDecisionRecorded(ports, ctx, "shadow-decision-synth-1", nc(10000));
+    await recordExecutionBlocked(ports, ctx, BLOCK_REASON);
+    await recordGate(ports, ctx, "preflight", "PASS");
+    await recordGate(ports, ctx, "qualifying_event", "PASS");
+    await recordGate(ports, ctx, "shadow_execution", "PASS");
+    await completeRun(
+      ports,
+      ctx,
+      "PASS",
+      undefined,
+      SYNTHETIC_SHADOW_BOUNDARY,
+      SYNTHETIC_GATES,
+      { transfer: 0, order: 0, providerMutation: 0 },
+      "clean"
+    );
+    return ctx;
+  }
+
+  /** Adapt the fake store's persisted run row to the reconstruction input type. */
+  function toReconstructionRunInput(stored: PersistedCertificationRun): CertificationRun {
+    return {
+      runId: stored.runId,
+      correlationId: stored.correlationId,
+      milestone: stored.milestone,
+      provider: stored.provider,
+      environment: stored.environment,
+      sourceCommit: stored.sourceCommit,
+      branch: stored.branch ?? undefined,
+      harness: stored.harness,
+      harnessVersion: stored.harnessVersion,
+      schemaVersion: stored.schemaVersion,
+      startedAt: stored.startedAt,
+      completedAt: stored.completedAt ?? undefined,
+      result: stored.result ?? "FAIL",
+      failureCode: stored.failureCode ?? undefined,
+      evidenceBoundary: stored.evidenceBoundary,
+      gates: stored.gates,
+      mutationCounts: stored.mutationCounts,
+      finalState: stored.finalState,
+    };
+  }
+
+  /** Reconstruct strictly from the fake store's persisted read paths. */
+  async function reconstructFromStore(
+    ports: AuditPorts & { _runs: Map<string, PersistedCertificationRun> },
+    ctx: RunContext
+  ) {
+    const stored = ports._runs.get(ctx.runId);
+    if (!stored) throw new Error(`synthetic run ${ctx.runId} not found in fake store`);
+    const history = await ports.events.listByRun(ctx.runId);
+    const providerCalls = toProviderCallEvidence(await ports.providerCalls.listByRun(ctx.runId));
+    return reconstructRun(toReconstructionRunInput(stored), history, providerCalls);
+  }
+
+  function findEvent<T extends AuditEvent["type"]>(
+    history: AuditEvent[],
+    type: T
+  ): Extract<AuditEvent, { type: T }> | undefined {
+    return history.find((e): e is Extract<AuditEvent, { type: T }> => e.type === type);
+  }
+
+  it("1. generates the synthetic run's events with the actual audit-store helpers (real producer vocabulary)", async () => {
+    const ports = createFakeAuditPorts();
+    const ctx = await driveSyntheticShadowRun(ports);
+    const history = await ports.events.listByRun(ctx.runId);
+
+    // Full lifecycle emitted in order by the real helpers (18 events).
+    expect(history.map(e => e.type)).toEqual([
+      "CERT_RUN_STARTED",
+      "PREFLIGHT_PASSED",
+      "PROVIDER_REQUEST_STARTED",
+      "PROVIDER_REQUEST_SUCCEEDED",
+      "OBSERVATION_RECEIVED",
+      "OBSERVATION_NORMALIZED",
+      "OBSERVATION_PERSISTED",
+      "CASH_EVENT_QUALIFIED",
+      "RULE_EVALUATED",
+      "CAPITAL_PLAN_CREATED",
+      "ALLOCATION_PLAN_CREATED",
+      "EXECUTION_POLICY_EVALUATED",
+      "SHADOW_DECISION_RECORDED",
+      "EXECUTION_BLOCKED",
+      "CERT_GATE_PASSED",
+      "CERT_GATE_PASSED",
+      "CERT_GATE_PASSED",
+      "CERT_RUN_COMPLETED",
+    ]);
+
+    // The producer contract that reconstruction must consume:
+    // EXECUTION_BLOCKED is emitted with status "failed" and a zero-mutation
+    // payload — the authoritative zero-order evidence.
+    const blocked = findEvent(history, "EXECUTION_BLOCKED");
+    expect(blocked?.status).toBe("failed");
+    expect(blocked?.payload).toEqual({
+      reason: BLOCK_REASON,
+      executeCount: 0,
+      transferCount: 0,
+      orderCount: 0,
+      providerMutationCount: 0,
+    });
+
+    const decision = findEvent(history, "SHADOW_DECISION_RECORDED");
+    expect(decision?.status).toBe("succeeded");
+    expect(decision?.payload).toEqual({
+      decisionId: "shadow-decision-synth-1",
+      disposition: "shadow",
+      deployableCents: nc(10000),
+    });
+
+    const policy = findEvent(history, "EXECUTION_POLICY_EVALUATED");
+    expect(policy?.status).toBe("succeeded");
+    expect(policy?.payload).toEqual({ disposition: "shadow", executeCount: 0 });
+  });
+
+  it("2. records a valid Shadow decision via the actual recordShadowDecisionRecorded helper", async () => {
+    const ports = createFakeAuditPorts();
+    const ctx = await startRun(synthConfig(ports));
+    await recordShadowDecisionRecorded(ports, ctx, "shadow-decision-synth-1", nc(10000));
+
+    const history = await ports.events.listByRun(ctx.runId);
+    const decision = findEvent(history, "SHADOW_DECISION_RECORDED");
+    expect(decision).toBeDefined();
+    expect(decision?.status).toBe("succeeded");
+    expect(decision?.payload).toEqual({
+      decisionId: "shadow-decision-synth-1",
+      disposition: "shadow",
+      deployableCents: nc(10000),
+    });
+  });
+
+  it("3. records execution blocking via the actual recordExecutionBlocked helper (status \"failed\", zero orders)", async () => {
+    const ports = createFakeAuditPorts();
+    const ctx = await startRun(synthConfig(ports));
+    await recordExecutionBlocked(ports, ctx, BLOCK_REASON);
+
+    const history = await ports.events.listByRun(ctx.runId);
+    const blocked = findEvent(history, "EXECUTION_BLOCKED");
+    expect(blocked).toBeDefined();
+    // The core F4 producer fact: the block is recorded as a FAILED event with
+    // an all-zero payload — the event's existence IS the zero-order evidence.
+    expect(blocked?.status).toBe("failed");
+    expect(blocked?.payload).toEqual({
+      reason: BLOCK_REASON,
+      executeCount: 0,
+      transferCount: 0,
+      orderCount: 0,
+      providerMutationCount: 0,
+    });
+  });
+
+  it("4. completes the synthetic run: run row finalized and CERT_RUN_COMPLETED emitted (adapter parity)", async () => {
+    const ports = createFakeAuditPorts();
+    const ctx = await driveSyntheticShadowRun(ports);
+
+    const stored = ports._runs.get(ctx.runId);
+    expect(stored?.result).toBe("PASS");
+    expect(stored?.completedAt).toBeTruthy();
+    expect(stored?.evidenceBoundary).toEqual(SYNTHETIC_SHADOW_BOUNDARY);
+    expect(stored?.mutationCounts).toEqual({ transfer: 0, order: 0, providerMutation: 0 });
+    expect(stored?.finalState).toBe("clean");
+
+    const completed = findEvent(await ports.events.listByRun(ctx.runId), "CERT_RUN_COMPLETED");
+    expect(completed?.status).toBe("succeeded"); // PASS → "succeeded" (real adapter parity)
+    expect(completed?.payload).toEqual({ result: "PASS", evidenceBoundary: SYNTHETIC_SHADOW_BOUNDARY });
+  });
+
+  it("5. reconstructs the completed synthetic run from the persisted event history", async () => {
+    const ports = createFakeAuditPorts();
+    const ctx = await driveSyntheticShadowRun(ports);
+    const reconstructed = await reconstructFromStore(ports, ctx);
+
+    // Identity + pipeline legs derived purely from the persisted history.
+    expect(reconstructed.evidenceKind).toBe("real");
+    expect(reconstructed.provider).toBe("plaid");
+    expect(reconstructed.environment).toBe("production");
+    expect(reconstructed.normalized).toBe(true);
+    expect(reconstructed.persisted).toBe(true);
+    expect(reconstructed.qualified).toBe(true);
+    expect(reconstructed.ruleVersion).toBe("rule-monthly-deposit");
+    expect(reconstructed.capitalPlan).toEqual({ deployableCents: 10000 });
+    expect(reconstructed.allocationPlan).toEqual({ totalDeployedCents: 10000, lines: 2 });
+    expect(reconstructed.executionPolicy).toEqual({ disposition: "shadow", executeCount: 0 });
+    expect(reconstructed.finishedCleanly).toBe(true);
+    expect(reconstructed.whatObserved).toBe("Observed credit of 10000 cents (posted)");
+  });
+
+  it("6. reconstructs the correctly blocked Shadow run as shadowOnly=true", async () => {
+    // RED at the pinned head (b4f1a421): recordExecutionBlocked() emits
+    // EXECUTION_BLOCKED with status "failed" (test 3), but reconstructRun()
+    // required status "succeeded" — so this legitimately Shadow-only run
+    // misreconstructed as shadowOnly=false. The fix consumes the producer's
+    // actual event semantics.
+    const ports = createFakeAuditPorts();
+    const ctx = await driveSyntheticShadowRun(ports);
+    const reconstructed = await reconstructFromStore(ports, ctx);
+
+    expect(reconstructed.shadowOnly).toBe(true);
+  });
+
+  it("7. infers no real order execution and no order failure from the blocked Shadow run", async () => {
+    const ports = createFakeAuditPorts();
+    const ctx = await driveSyntheticShadowRun(ports);
+    const reconstructed = await reconstructFromStore(ports, ctx);
+
+    // The run is attested shadow-only…
+    expect(reconstructed.shadowOnly).toBe(true);
+    // …the expected block is NOT evidence of execution:
+    expect(reconstructed.executionPolicy).toEqual({ disposition: "shadow", executeCount: 0 });
+    expect(reconstructed.providerMutationAttempted).toBe(false);
+    // …and it is NOT an order failure or provider error either:
+    expect(reconstructed.failedGate).toBeUndefined();
+    expect(reconstructed.safeProviderError).toEqual({
+      httpStatus: undefined,
+      plaidErrorType: undefined,
+      plaidErrorCode: undefined,
+      plaidRequestId: undefined,
+    });
+    expect(reconstructed.finishedCleanly).toBe(true);
+  });
+
+  it("8. rejects shadowOnly for incomplete or contradictory event histories", async () => {
+    // (a) Incomplete: execution block without a Shadow decision — a block alone
+    //     does not attest that the pipeline chose shadow.
+    {
+      const ports = createFakeAuditPorts();
+      const ctx = await driveSyntheticShadowRun(ports);
+      const stored = ports._runs.get(ctx.runId);
+      if (!stored) throw new Error("synthetic run missing");
+      const history = (await ports.events.listByRun(ctx.runId)).filter(
+        e => e.type !== "SHADOW_DECISION_RECORDED"
+      );
+      const reconstructed = reconstructRun(toReconstructionRunInput(stored), history, []);
+      expect(reconstructed.shadowOnly).toBe(false);
+    }
+
+    // (b) Incomplete: Shadow decision without an execution block — the
+    //     zero-order guarantee is not evidenced, so it is not attested.
+    {
+      const ports = createFakeAuditPorts();
+      const ctx = await driveSyntheticShadowRun(ports);
+      const stored = ports._runs.get(ctx.runId);
+      if (!stored) throw new Error("synthetic run missing");
+      const history = (await ports.events.listByRun(ctx.runId)).filter(
+        e => e.type !== "EXECUTION_BLOCKED"
+      );
+      const reconstructed = reconstructRun(toReconstructionRunInput(stored), history, []);
+      expect(reconstructed.shadowOnly).toBe(false);
+    }
+
+    // (c) Incomplete: shadow decision + block, but the EXECUTION_POLICY_EVALUATED
+    //     evidence is missing — internal consistency cannot be confirmed, so
+    //     the shadow-only attestation is not made (fail closed).
+    {
+      const ports = createFakeAuditPorts();
+      const ctx = await driveSyntheticShadowRun(ports);
+      const stored = ports._runs.get(ctx.runId);
+      if (!stored) throw new Error("synthetic run missing");
+      const history = (await ports.events.listByRun(ctx.runId)).filter(
+        e => e.type !== "EXECUTION_POLICY_EVALUATED"
+      );
+      const reconstructed = reconstructRun(toReconstructionRunInput(stored), history, []);
+      expect(reconstructed.shadowOnly).toBe(false);
+      expect(reconstructed.executionPolicy).toBeNull();
+    }
+
+    // (d) Contradictory: a block was recorded, but the policy itself planned
+    //     real orders (disposition "execute", executeCount 2). A block must
+    //     never launder a run that executed orders into shadowOnly=true.
+    {
+      const ports = createFakeAuditPorts();
+      const ctx = await driveSyntheticShadowRun(ports, {
+        policy: { disposition: "execute", executeCount: 2 },
+      });
+      const stored = ports._runs.get(ctx.runId);
+      if (!stored) throw new Error("synthetic run missing");
+      const history = await ports.events.listByRun(ctx.runId);
+      const reconstructed = reconstructRun(toReconstructionRunInput(stored), history, []);
+      expect(reconstructed.shadowOnly).toBe(false);
+      expect(reconstructed.executionPolicy).toEqual({ disposition: "execute", executeCount: 2 });
+    }
   });
 });
